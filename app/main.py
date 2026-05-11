@@ -1,7 +1,12 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from uuid import uuid4
+from datetime import datetime, timedelta, timezone
+from jose import jwt, JWTError
+import bcrypt
+import httpx
 
 app = FastAPI(title="MyUber API")
 
@@ -13,9 +18,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-rides = {}
-connections: list[WebSocket] = []
+SECRET_KEY = "myuber-dev-secret-key-change-in-production"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  
 
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/riders/login", auto_error=False)
+
+riders: dict[str, dict] = {}
+drivers: dict[str, dict] = {}
+rides: dict[str, dict] = {}
+connections: list[WebSocket] = []
 
 class Location(BaseModel):
     lat: float
@@ -53,7 +70,6 @@ def request_ride(payload: RideRequest):
 @app.get("/rides/{ride_id}")
 def get_ride(ride_id: str):
     return rides.get(ride_id, {"error": "Ride not found"})
-
 
 @app.websocket("/ws/rides/{ride_id}")
 async def ride_socket(websocket: WebSocket, ride_id: str):
