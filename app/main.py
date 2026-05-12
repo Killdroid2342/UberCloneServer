@@ -39,6 +39,31 @@ class Location(BaseModel):
     lng: float
 
 
+class RiderSignup(BaseModel):
+    email: str
+    password: str
+    name: str
+    phone: str
+
+
+class DriverSignup(BaseModel):
+    email: str
+    password: str
+    name: str
+    phone: str
+    vehicle_make: str
+    vehicle_model: str
+    vehicle_year: int
+    vehicle_color: str
+    vehicle_plate: str
+    license_number: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
 class RideRequest(BaseModel):
     rider_id: str
     pickup: Location
