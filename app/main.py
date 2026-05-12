@@ -93,6 +93,28 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 def root():
     return {"status": "MyUber API running"}
 
+@app.post("/riders/signup")
+def rider_signup(payload: RiderSignup):
+    for rider in riders.values():
+        if rider["email"] == payload.email:
+            raise HTTPException(status_code=400, detail="Email already registered")
+
+    rider_id = str(uuid4())
+    rider = {
+        "id": rider_id,
+        "email": payload.email,
+        "password_hash": hash_password(payload.password),
+        "name": payload.name,
+        "phone": payload.phone,
+        "role": "rider",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    riders[rider_id] = rider
+    safe = {k: v for k, v in rider.items() if k != "password_hash"}
+    return safe
+
+
+
 
 @app.post("/rides")
 def request_ride(payload: RideRequest):
