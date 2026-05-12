@@ -114,6 +114,49 @@ def rider_signup(payload: RiderSignup):
     return safe
 
 
+@app.post("/riders/login")
+def rider_login(payload: LoginRequest):
+    for rider in riders.values():
+        if rider["email"] == payload.email:
+            if verify_password(payload.password, rider["password_hash"]):
+                token = create_token({"sub": rider["id"], "role": "rider"})
+                safe = {k: v for k, v in rider.items() if k != "password_hash"}
+                return {"token": token, "user": safe}
+            else:
+                raise HTTPException(status_code=401, detail="Invalid password")
+    raise HTTPException(status_code=404, detail="Account not found")
+
+@app.post("/drivers/signup")
+def driver_signup(payload: DriverSignup):
+    for driver in drivers.values():
+        if driver["email"] == payload.email:
+            raise HTTPException(status_code=400, detail="Email already registered")
+
+    driver_id = str(uuid4())
+    driver = {
+        "id": driver_id,
+        "email": payload.email,
+        "password_hash": hash_password(payload.password),
+        "name": payload.name,
+        "phone": payload.phone,
+        "role": "driver",
+        "vehicle": {
+            "make": payload.vehicle_make,
+            "model": payload.vehicle_model,
+            "year": payload.vehicle_year,
+            "color": payload.vehicle_color,
+            "plate": payload.vehicle_plate,
+        },
+        "license_number": payload.license_number,
+        "onboarding_status": "complete",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    drivers[driver_id] = driver
+
+    safe = {k: v for k, v in driver.items() if k != "password_hash"}
+    return safe
+
+
 
 
 @app.post("/rides")
