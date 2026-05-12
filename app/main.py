@@ -185,7 +185,38 @@ def get_me(current_user: dict = Depends(get_current_user)):
     safe = {k: v for k, v in user.items() if k != "password_hash"}
     return safe
 
+@app.get("/search/locations")
+async def search_locations(q: str):
+    if not q or len(q) < 2:
+        return []
 
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={
+                "q": q,
+                "format": "json",
+                "limit": 5,
+                "addressdetails": 1,
+            },
+            headers={
+                "User-Agent": "MyUber-Dev/1.0",
+            },
+            timeout=10.0,
+        )
+
+    if response.status_code != 200:
+        return []
+
+    results = response.json()
+    return [
+        {
+            "name": r.get("display_name", ""),
+            "lat": float(r.get("lat", 0)),
+            "lng": float(r.get("lon", 0)),
+        }
+        for r in results
+    ]
 
 @app.post("/rides")
 def request_ride(payload: RideRequest):
