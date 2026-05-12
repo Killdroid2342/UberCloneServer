@@ -157,6 +157,34 @@ def driver_signup(payload: DriverSignup):
     return safe
 
 
+@app.post("/drivers/login")
+def driver_login(payload: LoginRequest):
+    for driver in drivers.values():
+        if driver["email"] == payload.email:
+            if verify_password(payload.password, driver["password_hash"]):
+                token = create_token({"sub": driver["id"], "role": "driver"})
+                safe = {k: v for k, v in driver.items() if k != "password_hash"}
+                return {"token": token, "user": safe}
+            else:
+                raise HTTPException(status_code=401, detail="Invalid password")
+    raise HTTPException(status_code=404, detail="Account not found")
+
+@app.get("/auth/me")
+def get_me(current_user: dict = Depends(get_current_user)):
+    user_id = current_user["user_id"]
+    role = current_user["role"]
+
+    if role == "rider":
+        user = riders.get(user_id)
+    else:
+        user = drivers.get(user_id)
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    safe = {k: v for k, v in user.items() if k != "password_hash"}
+    return safe
+
 
 
 @app.post("/rides")
