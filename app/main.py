@@ -1,12 +1,14 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel
+from pydantic import TypeAdapter, ValidationError
+from typing_extensions import TypedDict
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
 import bcrypt
 import httpx
+from math import asin, cos, radians, sin, sqrt
 
 app = FastAPI(title="MyUber API")
 
@@ -32,42 +34,49 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/riders/login", auto_error=False)
 riders: dict[str, dict] = {}
 drivers: dict[str, dict] = {}
 rides: dict[str, dict] = {}
-connections: list[WebSocket] = []
+ride_connections: dict[str, list[WebSocket]] = {}
+driver_connections: dict[str, list[WebSocket]] = {}
+DEFAULT_DRIVER_LOCATION = {"lat": 51.5074, "lng": -0.1278}
 
-class Location(BaseModel):
-    lat: float
-    lng: float
+Location = TypedDict("Location", {"lat": float, "lng": float})
 
+RiderSignup = TypedDict(
+    "RiderSignup",
+    {"email": str, "password": str, "name": str, "phone": str},
+)
 
-class RiderSignup(BaseModel):
-    email: str
-    password: str
-    name: str
-    phone: str
+DriverSignup = TypedDict(
+    "DriverSignup",
+    {
+        "email": str,
+        "password": str,
+        "name": str,
+        "phone": str,
+        "vehicle_make": str,
+        "vehicle_model": str,
+        "vehicle_year": int,
+        "vehicle_color": str,
+        "vehicle_plate": str,
+        "license_number": str,
+    },
+)
 
+LoginRequest = TypedDict("LoginRequest", {"email": str, "password": str})
 
-class DriverSignup(BaseModel):
-    email: str
-    password: str
-    name: str
-    phone: str
-    vehicle_make: str
-    vehicle_model: str
-    vehicle_year: int
-    vehicle_color: str
-    vehicle_plate: str
-    license_number: str
+RideRequest = TypedDict(
+    "RideRequest",
+    {"rider_id": str, "pickup": Location, "destination": Location},
+)
 
+RouteEstimateRequest = TypedDict(
+    "RouteEstimateRequest",
+    {"pickup": Location, "destination": Location},
+)
 
-class LoginRequest(BaseModel):
-    email: str
-    password: str
+DriverLocationRequest = TypedDict("DriverLocationRequest", {"location": Location})
+RiderLocationRequest = TypedDict("RiderLocationRequest", {"location": Location})
 
-
-class RideRequest(BaseModel):
-    rider_id: str
-    pickup: Location
-    destination: Location
+location_adapter = TypeAdapter(Location)
 
 def create_token(data: dict) -> str:
     to_encode = data.copy()
@@ -76,7 +85,7 @@ def create_token(data: dict) -> str:
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
-def get_current_user(token: str = Depends(oauth2_scheme)):
+def decode_auth_token(token: str | None) -> dict:
     if token is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
@@ -89,6 +98,68 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+
+
+
+
+async def assign_waiting_rides() -> None:
+    for ride in rides.values():
+        if ride.get("status") not in {"matching", "no_drivers_available"}:
+            continue
+        if ride.get("driver_id"):
+            continue
+        previous_status = ride["status"]
+        await assign_nearest_driver(ride)
+        if ride["status"] != previous_status:
+            await broadcast_ride(ride)
+
+
+async def update_driver_location_state(driver_id: str, location: dict) -> dict | None:
+    driver = drivers.get(driver_id)
+    if not driver:
+        return None
+
+    now = datetime.now(timezone.utc).isoformat()
+    driver["location"] = location
+    driver["last_location_at"] = now
+
+    active_ride = active_ride_for_driver(driver_id)
+    if active_ride:
+        active_ride["driver_location"] = location
+        active_ride["updated_at"] = now
+        await broadcast_ride(active_ride)
+        await broadcast_driver(
+            driver_id,
+            {
+                "type": "driver_location_update",
+                "location": location,
+                "ride": public_ride(active_ride),
+            },
+        )
+        return driver
+
+    if driver.get("availability") != "busy":
+        driver["availability"] = "available"
+    await assign_waiting_rides()
+    return driver
+
+
+async def update_rider_location_state(ride_id: str, rider_id: str, location: dict) -> dict:
+    ride = rides.get(ride_id)
+    if not ride:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    if ride.get("rider_id") != rider_id:
+        raise HTTPException(status_code=403, detail="Cannot update this ride")
+
+    ride["rider_location"] = location
+    ride["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    driver_id = ride.get("driver_id")
+    if driver_id:
+        await broadcast_driver(driver_id, {"type": "ride_update", "ride": public_ride(ride)})
+    await broadcast_ride(ride)
+    return ride
+
 @app.get("/")
 def root():
     return {"status": "MyUber API running"}
@@ -96,32 +167,30 @@ def root():
 @app.post("/riders/signup")
 def rider_signup(payload: RiderSignup):
     for rider in riders.values():
-        if rider["email"] == payload.email:
+        if rider["email"] == payload["email"]:
             raise HTTPException(status_code=400, detail="Email already registered")
 
     rider_id = str(uuid4())
     rider = {
         "id": rider_id,
-        "email": payload.email,
-        "password_hash": hash_password(payload.password),
-        "name": payload.name,
-        "phone": payload.phone,
+        "email": payload["email"],
+        "password_hash": hash_password(payload["password"]),
+        "name": payload["name"],
+        "phone": payload["phone"],
         "role": "rider",
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     riders[rider_id] = rider
-    safe = {k: v for k, v in rider.items() if k != "password_hash"}
-    return safe
+    return safe_user(rider)
 
 
 @app.post("/riders/login")
 def rider_login(payload: LoginRequest):
     for rider in riders.values():
-        if rider["email"] == payload.email:
-            if verify_password(payload.password, rider["password_hash"]):
+        if rider["email"] == payload["email"]:
+            if verify_password(payload["password"], rider["password_hash"]):
                 token = create_token({"sub": rider["id"], "role": "rider"})
-                safe = {k: v for k, v in rider.items() if k != "password_hash"}
-                return {"token": token, "user": safe}
+                return {"token": token, "user": safe_user(rider)}
             else:
                 raise HTTPException(status_code=401, detail="Invalid password")
     raise HTTPException(status_code=404, detail="Account not found")
@@ -129,42 +198,44 @@ def rider_login(payload: LoginRequest):
 @app.post("/drivers/signup")
 def driver_signup(payload: DriverSignup):
     for driver in drivers.values():
-        if driver["email"] == payload.email:
+        if driver["email"] == payload["email"]:
             raise HTTPException(status_code=400, detail="Email already registered")
 
     driver_id = str(uuid4())
     driver = {
         "id": driver_id,
-        "email": payload.email,
-        "password_hash": hash_password(payload.password),
-        "name": payload.name,
-        "phone": payload.phone,
+        "email": payload["email"],
+        "password_hash": hash_password(payload["password"]),
+        "name": payload["name"],
+        "phone": payload["phone"],
         "role": "driver",
         "vehicle": {
-            "make": payload.vehicle_make,
-            "model": payload.vehicle_model,
-            "year": payload.vehicle_year,
-            "color": payload.vehicle_color,
-            "plate": payload.vehicle_plate,
+            "make": payload["vehicle_make"],
+            "model": payload["vehicle_model"],
+            "year": payload["vehicle_year"],
+            "color": payload["vehicle_color"],
+            "plate": payload["vehicle_plate"],
         },
-        "license_number": payload.license_number,
+        "license_number": payload["license_number"],
         "onboarding_status": "complete",
+        "availability": "offline",
+        "location": None,
+        "current_ride_id": None,
+        "stats": {"accepted": 0, "rejected": 0},
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     drivers[driver_id] = driver
 
-    safe = {k: v for k, v in driver.items() if k != "password_hash"}
-    return safe
+    return safe_user(driver)
 
 
 @app.post("/drivers/login")
 def driver_login(payload: LoginRequest):
     for driver in drivers.values():
-        if driver["email"] == payload.email:
-            if verify_password(payload.password, driver["password_hash"]):
+        if driver["email"] == payload["email"]:
+            if verify_password(payload["password"], driver["password_hash"]):
                 token = create_token({"sub": driver["id"], "role": "driver"})
-                safe = {k: v for k, v in driver.items() if k != "password_hash"}
-                return {"token": token, "user": safe}
+                return {"token": token, "user": safe_user(driver)}
             else:
                 raise HTTPException(status_code=401, detail="Invalid password")
     raise HTTPException(status_code=404, detail="Account not found")
@@ -182,8 +253,33 @@ def get_me(current_user: dict = Depends(get_current_user)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    safe = {k: v for k, v in user.items() if k != "password_hash"}
-    return safe
+    return safe_user(user)
+
+
+@app.post("/drivers/location")
+async def update_driver_location(
+    payload: DriverLocationRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    driver_id = require_role(current_user, "driver")
+    driver = drivers.get(driver_id)
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver not found")
+
+    driver = await update_driver_location_state(driver_id, payload["location"])
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver not found")
+
+    return safe_user(driver)
+
+
+@app.get("/drivers/me/ride-request")
+def get_driver_ride_request(current_user: dict = Depends(get_current_user)):
+    driver_id = require_role(current_user, "driver")
+    ride = active_ride_for_driver(driver_id)
+    if not ride:
+        return None
+    return public_ride(ride)
 
 @app.get("/search/locations")
 async def search_locations(q: str):
@@ -218,46 +314,243 @@ async def search_locations(q: str):
         for r in results
     ]
 
-@app.post("/rides")
-def request_ride(payload: RideRequest):
-    ride_id = str(uuid4())
 
+@app.post("/routes/estimate")
+async def estimate_route(payload: RouteEstimateRequest):
+    pickup = payload["pickup"]
+    destination = payload["destination"]
+    coords = f"{pickup['lng']},{pickup['lat']};{destination['lng']},{destination['lat']}"
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://router.project-osrm.org/route/v1/driving/{coords}",
+                params={
+                    "overview": "full",
+                    "geometries": "geojson",
+                },
+                headers={
+                    "User-Agent": "MyUber-Dev/1.0",
+                },
+                timeout=10.0,
+            )
+    except httpx.HTTPError:
+        return fallback_route_estimate(pickup, destination)
+
+    if response.status_code != 200:
+        return fallback_route_estimate(pickup, destination)
+
+    data = response.json()
+    routes = data.get("routes", [])
+    if not routes:
+        return fallback_route_estimate(pickup, destination)
+
+    route = routes[0]
+    geometry = route.get("geometry", {}).get("coordinates", [])
+    route_points = []
+    for coord in geometry:
+        if not isinstance(coord, (list, tuple)) or len(coord) < 2:
+            continue
+        lng, lat = coord[:2]
+        if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+            route_points.append({"lat": lat, "lng": lng})
+
+    if len(route_points) < 2:
+        return fallback_route_estimate(pickup, destination)
+
+    return build_route_estimate(
+        (route.get("distance") or 0) / 1000,
+        (route.get("duration") or 0) / 60,
+        route_points,
+        "osrm",
+    )
+
+@app.post("/rides")
+async def request_ride(
+    payload: RideRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    rider_id = require_role(current_user, "rider")
+    if payload["rider_id"] != rider_id:
+        raise HTTPException(status_code=403, detail="Cannot request for another rider")
+
+    now = datetime.now(timezone.utc).isoformat()
+    ride_id = str(uuid4())
     ride = {
         "id": ride_id,
-        "rider_id": payload.rider_id,
-        "pickup": payload.pickup.model_dump(),
-        "destination": payload.destination.model_dump(),
-        "status": "requested",
+        "rider_id": rider_id,
+        "pickup": payload["pickup"],
+        "destination": payload["destination"],
+        "status": "matching",
+        "driver_id": None,
+        "driver_distance_km": None,
         "driver_location": None,
+        "rider_location": None,
+        "declined_driver_ids": [],
+        "created_at": now,
+        "updated_at": now,
     }
 
     rides[ride_id] = ride
-    return ride
+    await assign_nearest_driver(ride)
+    return public_ride(ride)
+
+
+@app.post("/rides/{ride_id}/rider-location")
+async def update_rider_location(
+    ride_id: str,
+    payload: RiderLocationRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    rider_id = require_role(current_user, "rider")
+    ride = await update_rider_location_state(ride_id, rider_id, payload["location"])
+    return public_ride(ride)
 
 
 @app.get("/rides/{ride_id}")
-def get_ride(ride_id: str):
-    return rides.get(ride_id, {"error": "Ride not found"})
+def get_ride(ride_id: str, current_user: dict = Depends(get_current_user)):
+    ride = rides.get(ride_id)
+    if not ride:
+        raise HTTPException(status_code=404, detail="Ride not found")
+
+    if not can_view_ride(current_user, ride):
+        raise HTTPException(status_code=403, detail="Cannot view this ride")
+
+    return public_ride(ride)
+
+
+@app.post("/rides/{ride_id}/accept")
+async def accept_ride(ride_id: str, current_user: dict = Depends(get_current_user)):
+    driver_id = require_role(current_user, "driver")
+    ride = rides.get(ride_id)
+    driver = drivers.get(driver_id)
+    if not ride or not driver:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    if ride.get("driver_id") != driver_id or ride.get("status") != "pending_driver":
+        raise HTTPException(status_code=409, detail="Ride is not assigned to this driver")
+
+    stats = driver.setdefault("stats", {"accepted": 0, "rejected": 0})
+    driver["availability"] = "busy"
+    driver["current_ride_id"] = ride_id
+    stats["accepted"] += 1
+    ride["status"] = "accepted"
+    ride["accepted_at"] = datetime.now(timezone.utc).isoformat()
+    ride["updated_at"] = ride["accepted_at"]
+
+    await broadcast_ride(ride)
+    await broadcast_driver(driver_id, {"type": "ride_update", "ride": public_ride(ride)})
+    return public_ride(ride)
+
+
+@app.post("/rides/{ride_id}/reject")
+async def reject_ride(ride_id: str, current_user: dict = Depends(get_current_user)):
+    driver_id = require_role(current_user, "driver")
+    ride = rides.get(ride_id)
+    driver = drivers.get(driver_id)
+    if not ride or not driver:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    if ride.get("driver_id") != driver_id or ride.get("status") != "pending_driver":
+        raise HTTPException(status_code=409, detail="Ride is not assigned to this driver")
+
+    stats = driver.setdefault("stats", {"accepted": 0, "rejected": 0})
+    if driver_id not in ride["declined_driver_ids"]:
+        ride["declined_driver_ids"].append(driver_id)
+    driver["availability"] = "available"
+    driver["current_ride_id"] = None
+    stats["rejected"] += 1
+
+    await broadcast_driver(driver_id, {"type": "ride_cleared", "ride_id": ride_id})
+    await assign_nearest_driver(ride)
+    await broadcast_ride(ride)
+    return public_ride(ride)
+
 
 @app.websocket("/ws/rides/{ride_id}")
-async def ride_socket(websocket: WebSocket, ride_id: str):
+async def ride_socket(websocket: WebSocket, ride_id: str, token: str | None = None):
+    current_user = await authenticate_socket(websocket, token)
+    if not current_user:
+        return
+
+    ride = rides.get(ride_id)
+    if not ride or not can_view_ride(current_user, ride):
+        await websocket.accept()
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
-    connections.append(websocket)
+    ride_connections.setdefault(ride_id, []).append(websocket)
+    await websocket.send_json({"type": "ride_update", "ride": public_ride(ride)})
 
     try:
         while True:
-            data = await websocket.receive_json()
+            message = await websocket.receive_json()
+            message_type = message.get("type")
 
-            if data["type"] == "driver_location":
-                rides[ride_id]["driver_location"] = data["location"]
+            if message_type == "ping":
+                await websocket.send_json({"type": "pong", "sent_at": message.get("sent_at")})
+                continue
 
-                message = {
-                    "type": "ride_update",
-                    "ride": rides[ride_id],
-                }
+            if message_type != "rider_location_update":
+                continue
 
-                for conn in connections:
-                    await conn.send_json(message)
+            if current_user["role"] != "rider":
+                await websocket.send_json({"type": "error", "detail": "Rider account required"})
+                continue
 
+            location = parse_location_payload(message.get("location"))
+            if not location:
+                await websocket.send_json({"type": "error", "detail": "Invalid location"})
+                continue
+
+            await update_rider_location_state(ride_id, current_user["user_id"], location)
     except WebSocketDisconnect:
-        connections.remove(websocket)
+        pass
+    finally:
+        sockets = ride_connections.get(ride_id, [])
+        if websocket in sockets:
+            sockets.remove(websocket)
+
+
+@app.websocket("/ws/drivers/{driver_id}")
+async def driver_socket(websocket: WebSocket, driver_id: str, token: str | None = None):
+    current_user = await authenticate_socket(websocket, token)
+    if not current_user:
+        return
+
+    if current_user["role"] != "driver" or current_user["user_id"] != driver_id:
+        await websocket.accept()
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    driver_connections.setdefault(driver_id, []).append(websocket)
+
+    ride = active_ride_for_driver(driver_id)
+    if ride:
+        event_type = "ride_request" if ride.get("status") == "pending_driver" else "ride_update"
+        await websocket.send_json({"type": event_type, "ride": public_ride(ride)})
+
+    try:
+        while True:
+            message = await websocket.receive_json()
+            message_type = message.get("type")
+
+            if message_type == "ping":
+                await websocket.send_json({"type": "pong", "sent_at": message.get("sent_at")})
+                continue
+
+            if message_type != "driver_location_update":
+                continue
+
+            location = parse_location_payload(message.get("location"))
+            if not location:
+                await websocket.send_json({"type": "error", "detail": "Invalid location"})
+                continue
+
+            await update_driver_location_state(driver_id, location)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        sockets = driver_connections.get(driver_id, [])
+        if websocket in sockets:
+            sockets.remove(websocket)
