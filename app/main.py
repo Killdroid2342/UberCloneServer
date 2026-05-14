@@ -99,6 +99,130 @@ def decode_auth_token(token: str | None) -> dict:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    return decode_auth_token(token)
+
+
+async def authenticate_socket(websocket: WebSocket, token: str | None) -> dict | None:
+    try:
+        return decode_auth_token(token)
+    except HTTPException:
+        await websocket.accept()
+        await websocket.close(code=1008)
+        return None
+
+
+def haversine_km(start: Location, end: Location) -> float:
+    earth_radius_km = 6371.0
+    lat1 = radians(start["lat"])
+    lng1 = radians(start["lng"])
+    lat2 = radians(end["lat"])
+    lng2 = radians(end["lng"])
+    dlat = lat2 - lat1
+    dlng = lng2 - lng1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlng / 2) ** 2
+    return 2 * earth_radius_km * asin(sqrt(a))
+
+
+def fare_for(distance_km: float, duration_min: float) -> float:
+    distance_miles = distance_km * 0.621371
+    fare = 3.50 + (distance_miles * 1.65) + (duration_min * 0.28)
+    return round(max(fare, 7.00), 2)
+
+
+def build_route_estimate(
+    distance_km: float,
+    duration_min: float,
+    route: list[dict],
+    source: str,
+) -> dict:
+    return {
+        "distance_km": round(distance_km, 2),
+        "duration_min": max(1, round(duration_min)),
+        "fare": fare_for(distance_km, duration_min),
+        "route": route,
+        "source": source,
+    }
+
+
+def fallback_route_estimate(pickup: Location, destination: Location) -> dict:
+    straight_line_km = haversine_km(pickup, destination)
+    driving_distance_km = straight_line_km * 1.28
+    duration_min = (driving_distance_km / 32) * 60
+    return build_route_estimate(
+        driving_distance_km,
+        duration_min,
+        [
+            {"lat": pickup["lat"], "lng": pickup["lng"]},
+            {"lat": destination["lat"], "lng": destination["lng"]},
+        ],
+        "fallback",
+    )
+
+
+def public_driver(driver: dict | None) -> dict | None:
+    if not driver:
+        return None
+    return {
+        "id": driver["id"],
+        "name": driver["name"],
+        "phone": driver["phone"],
+        "vehicle": driver.get("vehicle"),
+        "location": driver.get("location"),
+    }
+
+
+def public_ride(ride: dict) -> dict:
+    driver = drivers.get(ride.get("driver_id"))
+    serialized = {
+        key: value
+        for key, value in ride.items()
+        if key != "declined_driver_ids"
+    }
+    serialized["driver"] = public_driver(driver)
+    return serialized
+
+
+def safe_user(user: dict) -> dict:
+    return {k: v for k, v in user.items() if k != "password_hash"}
+
+
+def require_role(current_user: dict, role: str) -> str:
+    if current_user["role"] != role:
+        raise HTTPException(status_code=403, detail=f"{role.title()} account required")
+    return current_user["user_id"]
+
+
+def can_view_ride(current_user: dict, ride: dict) -> bool:
+    if current_user["role"] == "rider":
+        return ride.get("rider_id") == current_user["user_id"]
+    if current_user["role"] == "driver":
+        return ride.get("driver_id") == current_user["user_id"]
+    return False
+
+
+def parse_location_payload(payload: dict | None) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return location_adapter.validate_python(payload)
+    except ValidationError:
+        return None
+
+
+def active_ride_for_driver(driver_id: str) -> dict | None:
+    driver = drivers.get(driver_id)
+    if not driver:
+        return None
+    ride_id = driver.get("current_ride_id")
+    if not ride_id:
+        return None
+    ride = rides.get(ride_id)
+    if not ride or ride.get("driver_id") != driver_id:
+        return None
+    return ride
+
+
 
 
 
