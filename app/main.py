@@ -223,7 +223,82 @@ def active_ride_for_driver(driver_id: str) -> dict | None:
     return ride
 
 
+def available_driver_candidates(ride: dict) -> list[tuple[float, dict]]:
+    pickup = parse_location_payload(ride.get("pickup"))
+    if not pickup:
+        return []
+    declined = set(ride.get("declined_driver_ids", []))
+    candidates: list[tuple[float, dict]] = []
 
+    for driver in drivers.values():
+        if driver["id"] in declined:
+            continue
+        if driver.get("availability") != "available":
+            continue
+        if driver.get("current_ride_id"):
+            continue
+        if not driver.get("location"):
+            continue
+
+        driver_location = parse_location_payload(driver.get("location"))
+        if not driver_location:
+            continue
+        distance = haversine_km(driver_location, pickup)
+        candidates.append((distance, driver))
+
+    return sorted(candidates, key=lambda item: item[0])
+
+
+async def send_to_connections(connections: list[WebSocket], message: dict) -> None:
+    stale: list[WebSocket] = []
+    for websocket in list(connections):
+        try:
+            await websocket.send_json(message)
+        except Exception:
+            stale.append(websocket)
+
+    for websocket in stale:
+        if websocket in connections:
+            connections.remove(websocket)
+
+
+async def broadcast_ride(ride: dict) -> None:
+    await send_to_connections(
+        ride_connections.get(ride["id"], []),
+        {"type": "ride_update", "ride": public_ride(ride)},
+    )
+
+
+async def broadcast_driver(driver_id: str, message: dict) -> None:
+    await send_to_connections(driver_connections.get(driver_id, []), message)
+
+
+async def assign_nearest_driver(ride: dict) -> dict | None:
+    candidates = available_driver_candidates(ride)
+    if not candidates:
+        ride["status"] = "no_drivers_available"
+        ride["driver_id"] = None
+        ride["driver_distance_km"] = None
+        ride["driver_location"] = None
+        ride["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return None
+
+    distance, driver = candidates[0]
+    driver["availability"] = "pending"
+    driver["current_ride_id"] = ride["id"]
+
+    ride["status"] = "pending_driver"
+    ride["driver_id"] = driver["id"]
+    ride["driver_distance_km"] = round(distance, 2)
+    ride["driver_location"] = driver.get("location")
+    ride["matched_at"] = datetime.now(timezone.utc).isoformat()
+    ride["updated_at"] = ride["matched_at"]
+
+    await broadcast_driver(
+        driver["id"],
+        {"type": "ride_request", "ride": public_ride(ride)},
+    )
+    return driver
 
 
 async def assign_waiting_rides() -> None:
