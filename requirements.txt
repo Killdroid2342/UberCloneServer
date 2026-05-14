@@ -4,10 +4,13 @@ anyio==4.13.0
 click==8.3.3
 colorama==0.4.6
 fastapi==0.136.1
+bcrypt==5.0.0
+httpx==0.28.1
 h11==0.16.0
 idna==3.13
 pydantic==2.13.3
 pydantic_core==2.46.3
+python-jose==3.5.0
 python-dotenv==1.2.2
 starlette==1.0.0
 typing-inspection==0.4.2
