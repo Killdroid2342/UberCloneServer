@@ -555,6 +555,40 @@ async def listen_for_redis_events() -> None:
                 await pubsub.close()
 
 
+@app.on_event("startup")
+async def start_realtime_pubsub() -> None:
+    global redis_client, redis_subscriber_task
+
+    if not REDIS_URL:
+        return
+    if redis is None:
+        logger.warning("REDIS_URL is set but redis package is not installed")
+        return
+
+    try:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        await redis_client.ping()
+    except Exception:
+        redis_client = None
+        logger.exception("Could not connect to Redis; using local websocket fanout")
+        return
+
+    redis_subscriber_task = asyncio.create_task(listen_for_redis_events())
+
+
+@app.on_event("shutdown")
+async def stop_realtime_pubsub() -> None:
+    global redis_client, redis_subscriber_task
+
+    if redis_subscriber_task:
+        redis_subscriber_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await redis_subscriber_task
+        redis_subscriber_task = None
+
+    if redis_client:
+        await redis_client.aclose()
+        redis_client = None
 
 
 async def broadcast_ride(ride: dict) -> None:
