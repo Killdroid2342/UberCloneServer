@@ -494,6 +494,68 @@ async def send_to_connections(connections: list[WebSocket], message: dict) -> No
             connections.remove(websocket)
 
 
+async def dispatch_realtime_event(event: dict) -> None:
+    target = event.get("target")
+    target_id = event.get("target_id")
+    message = event.get("message")
+
+    if not isinstance(target_id, str) or not isinstance(message, dict):
+        return
+
+    if target == "ride":
+        await send_to_connections(ride_connections.get(target_id, []), message)
+    elif target == "driver":
+        await send_to_connections(driver_connections.get(target_id, []), message)
+
+
+async def fanout_realtime_event(target: str, target_id: str, message: dict) -> None:
+    event = {
+        "origin": INSTANCE_ID,
+        "target": target,
+        "target_id": target_id,
+        "message": message,
+    }
+
+    await dispatch_realtime_event(event)
+
+    if not redis_client:
+        return
+
+    try:
+        await redis_client.publish(REDIS_CHANNEL, json.dumps(event))
+    except Exception:
+        logger.exception("Failed to publish realtime event to Redis")
+
+
+async def listen_for_redis_events() -> None:
+    while redis_client:
+        pubsub = redis_client.pubsub()
+        try:
+            await pubsub.subscribe(REDIS_CHANNEL)
+            async for raw_event in pubsub.listen():
+                if raw_event.get("type") != "message":
+                    continue
+
+                try:
+                    event = json.loads(raw_event.get("data", "{}"))
+                except json.JSONDecodeError:
+                    continue
+
+                if event.get("origin") == INSTANCE_ID:
+                    continue
+
+                await dispatch_realtime_event(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Redis realtime subscriber crashed; reconnecting")
+            await asyncio.sleep(2)
+        finally:
+            with contextlib.suppress(Exception):
+                await pubsub.close()
+
+
+
 
 async def broadcast_ride(ride: dict) -> None:
     await fanout_realtime_event(
