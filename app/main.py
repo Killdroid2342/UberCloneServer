@@ -6,9 +6,19 @@ from typing_extensions import TypedDict
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
+import asyncio
 import bcrypt
+import contextlib
 import httpx
+import json
+import logging
+import os
 from math import asin, cos, radians, sin, sqrt
+
+try:
+    import redis.asyncio as redis
+except ImportError:
+    redis = None
 
 app = FastAPI(title="MyUber API")
 
@@ -23,6 +33,11 @@ app.add_middleware(
 SECRET_KEY = "myuber-dev-secret-key-change-in-production"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  
+INSTANCE_ID = str(uuid4())
+REDIS_URL = os.getenv("REDIS_URL")
+REDIS_CHANNEL = os.getenv("REDIS_CHANNEL", "myuber:realtime")
+
+logger = logging.getLogger("myuber")
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -37,6 +52,48 @@ rides: dict[str, dict] = {}
 ride_connections: dict[str, list[WebSocket]] = {}
 driver_connections: dict[str, list[WebSocket]] = {}
 DEFAULT_DRIVER_LOCATION = {"lat": 51.5074, "lng": -0.1278}
+redis_client = None
+redis_subscriber_task: asyncio.Task | None = None
+
+RIDE_STATUSES = {
+    "matching",
+    "pending_driver",
+    "accepted",
+    "arrived",
+    "in_progress",
+    "completed",
+    "cancelled",
+    "no_drivers_available",
+}
+TERMINAL_RIDE_STATUSES = {"completed", "cancelled"}
+DRIVER_PROGRESS_STATUSES = {"arrived", "in_progress", "completed"}
+RIDER_CANCELABLE_STATUSES = {
+    "matching",
+    "pending_driver",
+    "accepted",
+    "arrived",
+    "no_drivers_available",
+}
+DRIVER_CANCELABLE_STATUSES = {"accepted", "arrived"}
+ALLOWED_RIDE_TRANSITIONS = {
+    "matching": {"pending_driver", "no_drivers_available", "cancelled"},
+    "no_drivers_available": {"matching", "pending_driver", "cancelled"},
+    "pending_driver": {"matching", "accepted", "no_drivers_available", "cancelled"},
+    "accepted": {"arrived", "cancelled"},
+    "arrived": {"in_progress", "cancelled"},
+    "in_progress": {"completed"},
+    "completed": set(),
+    "cancelled": set(),
+}
+RIDE_STATUS_TIMESTAMPS = {
+    "pending_driver": "matched_at",
+    "accepted": "accepted_at",
+    "arrived": "arrived_at",
+    "in_progress": "started_at",
+    "completed": "completed_at",
+    "cancelled": "cancelled_at",
+    "no_drivers_available": "no_drivers_available_at",
+}
 
 Location = TypedDict("Location", {"lat": float, "lng": float})
 
@@ -74,9 +131,13 @@ RouteEstimateRequest = TypedDict(
 )
 
 DriverLocationRequest = TypedDict("DriverLocationRequest", {"location": Location})
+DriverAvailabilityRequest = TypedDict("DriverAvailabilityRequest", {"online": bool})
 RiderLocationRequest = TypedDict("RiderLocationRequest", {"location": Location})
+RideStatusUpdateRequest = TypedDict("RideStatusUpdateRequest", {"status": str})
 
 location_adapter = TypeAdapter(Location)
+
+
 
 def create_token(data: dict) -> str:
     to_encode = data.copy()
@@ -135,12 +196,14 @@ def build_route_estimate(
     duration_min: float,
     route: list[dict],
     source: str,
+    steps: list[dict] | None = None,
 ) -> dict:
     return {
         "distance_km": round(distance_km, 2),
         "duration_min": max(1, round(duration_min)),
         "fare": fare_for(distance_km, duration_min),
         "route": route,
+        "steps": steps or [],
         "source": source,
     }
 
@@ -149,15 +212,110 @@ def fallback_route_estimate(pickup: Location, destination: Location) -> dict:
     straight_line_km = haversine_km(pickup, destination)
     driving_distance_km = straight_line_km * 1.28
     duration_min = (driving_distance_km / 32) * 60
+    route = [
+        {"lat": pickup["lat"], "lng": pickup["lng"]},
+        {"lat": destination["lat"], "lng": destination["lng"]},
+    ]
     return build_route_estimate(
         driving_distance_km,
         duration_min,
-        [
-            {"lat": pickup["lat"], "lng": pickup["lng"]},
-            {"lat": destination["lat"], "lng": destination["lng"]},
-        ],
+        route,
         "fallback",
+        [
+            {
+                "instruction": "Head toward the destination",
+                "distance_km": round(driving_distance_km, 2),
+                "duration_min": max(1, round(duration_min)),
+                "location": route[0],
+            },
+            {
+                "instruction": "Arrive at the destination",
+                "distance_km": 0,
+                "duration_min": 0,
+                "location": route[-1],
+            },
+        ],
     )
+
+
+def route_point_from_osrm_location(location: list | tuple | None) -> dict | None:
+    if not isinstance(location, (list, tuple)) or len(location) < 2:
+        return None
+    lng, lat = location[:2]
+    if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+        return None
+    return {"lat": lat, "lng": lng}
+
+
+def road_suffix(name: str | None) -> str:
+    clean_name = (name or "").strip()
+    return f" onto {clean_name}" if clean_name else ""
+
+
+def direction_phrase(modifier: str | None) -> str:
+    if not modifier:
+        return ""
+    return modifier.replace("slight ", "slightly ")
+
+
+def instruction_for_osrm_step(step: dict) -> str:
+    maneuver = step.get("maneuver") or {}
+    step_type = maneuver.get("type")
+    modifier = direction_phrase(maneuver.get("modifier"))
+    road = road_suffix(step.get("name"))
+
+    if step_type == "depart":
+        direction = f" {modifier}" if modifier else ""
+        return f"Head{direction}{road}".strip()
+    if step_type == "arrive":
+        return "Arrive at the destination"
+    if step_type == "turn":
+        direction = modifier or "ahead"
+        return f"Turn {direction}{road}"
+    if step_type in {"new name", "continue"}:
+        return f"Continue{road}" if road else "Continue straight"
+    if step_type == "merge":
+        direction = f" {modifier}" if modifier else ""
+        return f"Merge{direction}{road}".strip()
+    if step_type in {"on ramp", "off ramp"}:
+        direction = f" {modifier}" if modifier else ""
+        ramp = "Take the ramp" if step_type == "on ramp" else "Take the exit"
+        return f"{ramp}{direction}{road}".strip()
+    if step_type == "fork":
+        direction = modifier or "ahead"
+        return f"Keep {direction}{road}"
+    if step_type == "end of road":
+        direction = modifier or "ahead"
+        return f"At the end of the road, turn {direction}{road}"
+    if step_type in {"roundabout", "rotary"}:
+        exit_number = maneuver.get("exit")
+        if exit_number:
+            return f"At the roundabout, take exit {exit_number}{road}"
+        return f"Enter the roundabout{road}"
+    if step_type == "notification":
+        return f"Continue{road}" if road else "Continue"
+
+    return f"Continue{road}" if road else "Proceed to the next step"
+
+
+def steps_from_osrm_legs(legs: list) -> list[dict]:
+    route_steps: list[dict] = []
+
+    for leg in legs:
+        for step in leg.get("steps", []):
+            location = route_point_from_osrm_location((step.get("maneuver") or {}).get("location"))
+            distance_km = (step.get("distance") or 0) / 1000
+            duration_min = (step.get("duration") or 0) / 60
+            route_steps.append(
+                {
+                    "instruction": instruction_for_osrm_step(step),
+                    "distance_km": round(distance_km, 2),
+                    "duration_min": max(0, round(duration_min)),
+                    "location": location,
+                }
+            )
+
+    return route_steps
 
 
 def public_driver(driver: dict | None) -> dict | None:
@@ -220,6 +378,8 @@ def active_ride_for_driver(driver_id: str) -> dict | None:
     ride = rides.get(ride_id)
     if not ride or ride.get("driver_id") != driver_id:
         return None
+    if ride.get("status") in TERMINAL_RIDE_STATUSES:
+        return None
     return ride
 
 
@@ -262,37 +422,42 @@ async def send_to_connections(connections: list[WebSocket], message: dict) -> No
             connections.remove(websocket)
 
 
+
 async def broadcast_ride(ride: dict) -> None:
-    await send_to_connections(
-        ride_connections.get(ride["id"], []),
+    await fanout_realtime_event(
+        "ride",
+        ride["id"],
         {"type": "ride_update", "ride": public_ride(ride)},
     )
 
 
 async def broadcast_driver(driver_id: str, message: dict) -> None:
-    await send_to_connections(driver_connections.get(driver_id, []), message)
+    await fanout_realtime_event("driver", driver_id, message)
 
 
 async def assign_nearest_driver(ride: dict) -> dict | None:
+    if ride.get("status") in TERMINAL_RIDE_STATUSES:
+        return None
+
     candidates = available_driver_candidates(ride)
     if not candidates:
-        ride["status"] = "no_drivers_available"
+        set_ride_status(ride, "no_drivers_available", "system", allow_same=True)
         ride["driver_id"] = None
         ride["driver_distance_km"] = None
         ride["driver_location"] = None
-        ride["updated_at"] = datetime.now(timezone.utc).isoformat()
         return None
 
     distance, driver = candidates[0]
     driver["availability"] = "pending"
     driver["current_ride_id"] = ride["id"]
 
-    ride["status"] = "pending_driver"
+    matched_at = now_iso()
+    set_ride_status(ride, "pending_driver", "system", allow_same=True)
     ride["driver_id"] = driver["id"]
     ride["driver_distance_km"] = round(distance, 2)
     ride["driver_location"] = driver.get("location")
-    ride["matched_at"] = datetime.now(timezone.utc).isoformat()
-    ride["updated_at"] = ride["matched_at"]
+    ride["matched_at"] = matched_at
+    ride["updated_at"] = matched_at
 
     await broadcast_driver(
         driver["id"],
@@ -337,10 +502,15 @@ async def update_driver_location_state(driver_id: str, location: dict) -> dict |
         )
         return driver
 
+    if driver.get("availability") == "offline":
+        return driver
+
     if driver.get("availability") != "busy":
         driver["availability"] = "available"
     await assign_waiting_rides()
     return driver
+
+
 
 
 async def update_rider_location_state(ride_id: str, rider_id: str, location: dict) -> dict:
@@ -349,9 +519,11 @@ async def update_rider_location_state(ride_id: str, rider_id: str, location: dic
         raise HTTPException(status_code=404, detail="Ride not found")
     if ride.get("rider_id") != rider_id:
         raise HTTPException(status_code=403, detail="Cannot update this ride")
+    if ride.get("status") in TERMINAL_RIDE_STATUSES:
+        raise HTTPException(status_code=409, detail="Ride is closed")
 
     ride["rider_location"] = location
-    ride["updated_at"] = datetime.now(timezone.utc).isoformat()
+    ride["updated_at"] = now_iso()
 
     driver_id = ride.get("driver_id")
     if driver_id:
@@ -472,6 +644,19 @@ async def update_driver_location(
     return safe_user(driver)
 
 
+@app.post("/drivers/availability")
+async def update_driver_availability(
+    payload: DriverAvailabilityRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    driver_id = require_role(current_user, "driver")
+    driver = await set_driver_availability_state(driver_id, payload["online"])
+    if not driver:
+        raise HTTPException(status_code=404, detail="Driver not found")
+
+    return safe_user(driver)
+
+
 @app.get("/drivers/me/ride-request")
 def get_driver_ride_request(current_user: dict = Depends(get_current_user)):
     driver_id = require_role(current_user, "driver")
@@ -527,6 +712,7 @@ async def estimate_route(payload: RouteEstimateRequest):
                 params={
                     "overview": "full",
                     "geometries": "geojson",
+                    "steps": "true",
                 },
                 headers={
                     "User-Agent": "MyUber-Dev/1.0",
@@ -562,6 +748,7 @@ async def estimate_route(payload: RouteEstimateRequest):
         (route.get("duration") or 0) / 60,
         route_points,
         "osrm",
+        steps_from_osrm_legs(route.get("legs", [])),
     )
 
 @app.post("/rides")
@@ -573,7 +760,7 @@ async def request_ride(
     if payload["rider_id"] != rider_id:
         raise HTTPException(status_code=403, detail="Cannot request for another rider")
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_iso()
     ride_id = str(uuid4())
     ride = {
         "id": ride_id,
@@ -586,6 +773,14 @@ async def request_ride(
         "driver_location": None,
         "rider_location": None,
         "declined_driver_ids": [],
+        "status_history": [
+            {
+                "from": None,
+                "status": "matching",
+                "actor": "rider",
+                "at": now,
+            }
+        ],
         "created_at": now,
         "updated_at": now,
     }
@@ -632,9 +827,7 @@ async def accept_ride(ride_id: str, current_user: dict = Depends(get_current_use
     driver["availability"] = "busy"
     driver["current_ride_id"] = ride_id
     stats["accepted"] += 1
-    ride["status"] = "accepted"
-    ride["accepted_at"] = datetime.now(timezone.utc).isoformat()
-    ride["updated_at"] = ride["accepted_at"]
+    set_ride_status(ride, "accepted", "driver")
 
     await broadcast_ride(ride)
     await broadcast_driver(driver_id, {"type": "ride_update", "ride": public_ride(ride)})
@@ -657,11 +850,13 @@ async def reject_ride(ride_id: str, current_user: dict = Depends(get_current_use
     driver["availability"] = "available"
     driver["current_ride_id"] = None
     stats["rejected"] += 1
+    set_ride_status(ride, "matching", "driver")
 
     await broadcast_driver(driver_id, {"type": "ride_cleared", "ride_id": ride_id})
     await assign_nearest_driver(ride)
     await broadcast_ride(ride)
     return public_ride(ride)
+
 
 
 @app.websocket("/ws/rides/{ride_id}")
@@ -736,6 +931,28 @@ async def driver_socket(websocket: WebSocket, driver_id: str, token: str | None 
 
             if message_type == "ping":
                 await websocket.send_json({"type": "pong", "sent_at": message.get("sent_at")})
+                continue
+
+            if message_type == "availability_update":
+                online = message.get("online")
+                if not isinstance(online, bool):
+                    await websocket.send_json({"type": "error", "detail": "Invalid availability"})
+                    continue
+
+                try:
+                    driver = await set_driver_availability_state(driver_id, online)
+                except HTTPException as exc:
+                    await websocket.send_json({"type": "error", "detail": exc.detail})
+                    continue
+
+                if driver:
+                    await websocket.send_json(
+                        {
+                            "type": "availability_update",
+                            "availability": driver.get("availability"),
+                            "online": driver.get("availability") != "offline",
+                        }
+                    )
                 continue
 
             if message_type != "driver_location_update":
