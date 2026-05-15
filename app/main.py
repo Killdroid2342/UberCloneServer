@@ -583,6 +583,65 @@ async def update_driver_location_state(driver_id: str, location: dict) -> dict |
     return driver
 
 
+async def set_driver_availability_state(driver_id: str, online: bool) -> dict | None:
+    driver = drivers.get(driver_id)
+    if not driver:
+        return None
+
+    active_ride = active_ride_for_driver(driver_id)
+
+    if not online:
+        if active_ride:
+            ride_status = active_ride.get("status")
+            if ride_status != "pending_driver":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Complete or cancel the active ride before going offline",
+                )
+
+        driver["availability"] = "offline"
+        driver["last_offline_at"] = now_iso()
+
+        if active_ride:
+            if driver_id not in active_ride["declined_driver_ids"]:
+                active_ride["declined_driver_ids"].append(driver_id)
+            driver["current_ride_id"] = None
+            active_ride["driver_id"] = None
+            active_ride["driver_distance_km"] = None
+            active_ride["driver_location"] = None
+            set_ride_status(active_ride, "matching", "driver")
+
+            await broadcast_driver(driver_id, {"type": "ride_cleared", "ride_id": active_ride["id"]})
+            await assign_nearest_driver(active_ride)
+            await broadcast_ride(active_ride)
+        else:
+            driver["current_ride_id"] = None
+
+        await broadcast_driver(
+            driver_id,
+            {"type": "availability_update", "availability": "offline", "online": False},
+        )
+        return driver
+
+    driver["last_online_at"] = now_iso()
+    if not driver.get("location"):
+        driver["location"] = DEFAULT_DRIVER_LOCATION.copy()
+
+    if active_ride:
+        driver["availability"] = "pending" if active_ride.get("status") == "pending_driver" else "busy"
+    else:
+        driver["availability"] = "available"
+
+    await broadcast_driver(
+        driver_id,
+        {
+            "type": "availability_update",
+            "availability": driver["availability"],
+            "online": True,
+        },
+    )
+    await assign_waiting_rides()
+    return driver
 
 
 async def update_rider_location_state(ride_id: str, rider_id: str, location: dict) -> dict:
