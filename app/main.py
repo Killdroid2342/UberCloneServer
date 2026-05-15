@@ -137,6 +137,78 @@ RideStatusUpdateRequest = TypedDict("RideStatusUpdateRequest", {"status": str})
 
 location_adapter = TypeAdapter(Location)
 
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def format_status(status: str | None) -> str:
+    if not status:
+        return "unknown"
+    return status.replace("_", " ")
+
+
+def assert_valid_ride_status(status: str) -> None:
+    if status not in RIDE_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Unknown ride status: {status}")
+
+
+def set_ride_status(
+    ride: dict,
+    next_status: str,
+    actor: str,
+    *,
+    allow_same: bool = False,
+) -> bool:
+    assert_valid_ride_status(next_status)
+    previous_status = ride.get("status")
+
+    if previous_status == next_status:
+        if allow_same:
+            ride["updated_at"] = now_iso()
+            return False
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ride is already {format_status(next_status)}",
+        )
+
+    allowed = ALLOWED_RIDE_TRANSITIONS.get(previous_status, set())
+    if next_status not in allowed:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot transition ride from "
+                f"{format_status(previous_status)} to {format_status(next_status)}"
+            ),
+        )
+
+    changed_at = now_iso()
+    ride["status"] = next_status
+    ride["updated_at"] = changed_at
+
+    timestamp_field = RIDE_STATUS_TIMESTAMPS.get(next_status)
+    if timestamp_field:
+        ride[timestamp_field] = changed_at
+
+    ride.setdefault("status_history", []).append(
+        {
+            "from": previous_status,
+            "status": next_status,
+            "actor": actor,
+            "at": changed_at,
+        }
+    )
+    return True
+
+
+def release_driver_for_ride(ride: dict, availability: str = "available") -> None:
+    driver_id = ride.get("driver_id")
+    driver = drivers.get(driver_id) if driver_id else None
+    if not driver:
+        return
+    if driver.get("current_ride_id") == ride.get("id"):
+        driver["current_ride_id"] = None
+    if driver.get("availability") != "offline":
+        driver["availability"] = availability
 
 
 def create_token(data: dict) -> str:
@@ -857,6 +929,64 @@ async def reject_ride(ride_id: str, current_user: dict = Depends(get_current_use
     await broadcast_ride(ride)
     return public_ride(ride)
 
+
+@app.post("/rides/{ride_id}/status")
+async def update_ride_status(
+    ride_id: str,
+    payload: RideStatusUpdateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    driver_id = require_role(current_user, "driver")
+    ride = rides.get(ride_id)
+    if not ride:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    if ride.get("driver_id") != driver_id:
+        raise HTTPException(status_code=403, detail="Cannot update this ride")
+
+    next_status = payload["status"]
+    if next_status not in DRIVER_PROGRESS_STATUSES:
+        raise HTTPException(status_code=400, detail="Unsupported driver status update")
+
+    set_ride_status(ride, next_status, "driver")
+    if next_status == "completed":
+        release_driver_for_ride(ride)
+
+    await broadcast_ride(ride)
+    await broadcast_driver(driver_id, {"type": "ride_update", "ride": public_ride(ride)})
+    return public_ride(ride)
+
+
+@app.post("/rides/{ride_id}/cancel")
+async def cancel_ride(ride_id: str, current_user: dict = Depends(get_current_user)):
+    ride = rides.get(ride_id)
+    if not ride:
+        raise HTTPException(status_code=404, detail="Ride not found")
+
+    actor = current_user["role"]
+    user_id = current_user["user_id"]
+    if actor == "rider":
+        if ride.get("rider_id") != user_id:
+            raise HTTPException(status_code=403, detail="Cannot cancel this ride")
+        if ride.get("status") not in RIDER_CANCELABLE_STATUSES:
+            raise HTTPException(status_code=409, detail="Ride cannot be cancelled now")
+    elif actor == "driver":
+        if ride.get("driver_id") != user_id:
+            raise HTTPException(status_code=403, detail="Cannot cancel this ride")
+        if ride.get("status") not in DRIVER_CANCELABLE_STATUSES:
+            raise HTTPException(status_code=409, detail="Ride cannot be cancelled now")
+    else:
+        raise HTTPException(status_code=403, detail="Cannot cancel this ride")
+
+    driver_id = ride.get("driver_id")
+    set_ride_status(ride, "cancelled", actor)
+    release_driver_for_ride(ride)
+
+    await broadcast_ride(ride)
+    if driver_id:
+        await broadcast_driver(driver_id, {"type": "ride_update", "ride": public_ride(ride)})
+        await broadcast_driver(driver_id, {"type": "ride_cleared", "ride_id": ride_id})
+
+    return public_ride(ride)
 
 
 @app.websocket("/ws/rides/{ride_id}")
