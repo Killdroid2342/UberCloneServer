@@ -1,11 +1,16 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import TypeAdapter, ValidationError
-from typing_extensions import TypedDict
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from typing_extensions import NotRequired, TypedDict
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from jose import jwt, JWTError
+from dotenv import load_dotenv
 import asyncio
 import bcrypt
 import contextlib
@@ -14,6 +19,9 @@ import httpx
 import json
 import logging
 import os
+import secrets
+import smtplib
+import time
 from math import asin, cos, radians, sin, sqrt
 
 try:
@@ -22,42 +30,271 @@ except ImportError:
     redis = None
 
 try:
+    from pywebpush import WebPushException, webpush
+except ImportError:
+    WebPushException = None
+    webpush = None
+
+try:
     import asyncpg
 except ImportError:
     asyncpg = None
+
+load_dotenv()
+
+
+def parse_csv_env(name: str, default: str) -> list[str]:
+    raw_value = os.getenv(name, default)
+    return [value.strip() for value in raw_value.split(",") if value.strip()]
+
+
+def parse_float_env(name: str, default: str) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except ValueError:
+        return float(default)
+
+
+def parse_int_env(name: str, default: str) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except ValueError:
+        return int(default)
+
+
+def parse_bool_env(name: str, default: str = "true") -> bool:
+    return os.getenv(name, default).strip().lower() not in {"0", "false", "no", "off"}
+
 
 app = FastAPI(title="MyUber API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=parse_csv_env("MYUBER_ALLOWED_ORIGINS", "*"),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-SECRET_KEY = "myuber-dev-secret-key-change-in-production"
+SECRET_KEY = os.getenv("MYUBER_SECRET_KEY") or os.getenv("SECRET_KEY")
+USING_GENERATED_SECRET_KEY = not bool(SECRET_KEY)
+if not SECRET_KEY:
+    SECRET_KEY = f"{uuid4().hex}{uuid4().hex}"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  
+ACCESS_TOKEN_EXPIRE_MINUTES = parse_int_env("MYUBER_ACCESS_TOKEN_EXPIRE_MINUTES", "15")
+REFRESH_TOKEN_EXPIRE_DAYS = parse_int_env("MYUBER_REFRESH_TOKEN_EXPIRE_DAYS", "30")
 INSTANCE_ID = str(uuid4())
+APP_STARTED_AT = time.time()
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
 REDIS_CHANNEL = os.getenv("REDIS_CHANNEL", "myuber:realtime")
 REDIS_CACHE_PREFIX = os.getenv("REDIS_CACHE_PREFIX", "myuber:cache")
 REDIS_CACHE_TTL_SECONDS = int(os.getenv("REDIS_CACHE_TTL_SECONDS", "900"))
+RATE_LIMIT_ENABLED = parse_bool_env("MYUBER_RATE_LIMIT_ENABLED", "true")
+RATE_LIMIT_DEFAULT_PER_MINUTE = parse_int_env("MYUBER_RATE_LIMIT_DEFAULT_PER_MINUTE", "180")
+RATE_LIMIT_READ_PER_MINUTE = parse_int_env("MYUBER_RATE_LIMIT_READ_PER_MINUTE", "300")
+RATE_LIMIT_LOGIN_PER_MINUTE = parse_int_env("MYUBER_RATE_LIMIT_LOGIN_PER_MINUTE", "6")
+RATE_LIMIT_SIGNUP_PER_HOUR = parse_int_env("MYUBER_RATE_LIMIT_SIGNUP_PER_HOUR", "10")
+RATE_LIMIT_REFRESH_PER_MINUTE = parse_int_env("MYUBER_RATE_LIMIT_REFRESH_PER_MINUTE", "30")
+RATE_LIMIT_RIDE_REQUESTS_PER_MINUTE = parse_int_env("MYUBER_RATE_LIMIT_RIDE_REQUESTS_PER_MINUTE", "12")
+ROUTING_PROVIDER = os.getenv("ROUTING_PROVIDER", "osrm").strip().lower()
+try:
+    ROUTING_TIMEOUT_SECONDS = float(os.getenv("ROUTING_TIMEOUT_SECONDS", "10"))
+except ValueError:
+    ROUTING_TIMEOUT_SECONDS = 10.0
+OSRM_BASE_URL = os.getenv("OSRM_BASE_URL", "https://router.project-osrm.org").rstrip("/")
+OSRM_PROFILE = os.getenv("OSRM_PROFILE", "driving").strip()
+GRAPHHOPPER_BASE_URL = os.getenv("GRAPHHOPPER_BASE_URL", "https://graphhopper.com/api/1").rstrip("/")
+GRAPHHOPPER_PROFILE = os.getenv("GRAPHHOPPER_PROFILE", "car").strip()
+GRAPHHOPPER_API_KEY = os.getenv("GRAPHHOPPER_API_KEY")
 DATABASE_STATE_KEY = "runtime"
 DEFAULT_ADMIN_EMAIL = os.getenv("MYUBER_ADMIN_EMAIL", "admin@myuber.local")
-DEFAULT_ADMIN_PASSWORD = os.getenv("MYUBER_ADMIN_PASSWORD", "admin123")
+DEFAULT_ADMIN_PASSWORD = os.getenv("MYUBER_ADMIN_PASSWORD")
+USING_GENERATED_ADMIN_PASSWORD = not bool(DEFAULT_ADMIN_PASSWORD)
+if not DEFAULT_ADMIN_PASSWORD:
+    DEFAULT_ADMIN_PASSWORD = uuid4().hex
 PLATFORM_FEE_RATE = 0.20
 FARE_CURRENCY = "USD"
+DEFAULT_RIDER_WALLET_BALANCE = parse_float_env("MYUBER_DEFAULT_WALLET_BALANCE", "50")
+WALLET_TOP_UP_MIN = 1.00
+WALLET_TOP_UP_MAX = 500.00
 BASE_FARE = 3.50
 PER_MILE_RATE = 1.65
 PER_MINUTE_RATE = 0.28
 MINIMUM_FARE = 7.00
+CANCELLATION_FEE_MIN = 3.00
+CANCELLATION_FEE_MAX = 10.00
+CANCELLATION_FEE_RATE = 0.25
 SURGE_MAX_MULTIPLIER = 2.25
 SURGE_RESPONSE_FACTOR = 0.35
+SCHEDULED_RIDE_CHECK_INTERVAL_SECONDS = 30
+DISPATCH_REQUEST_TIMEOUT_SECONDS = int(os.getenv("MYUBER_DISPATCH_TIMEOUT_SECONDS", "30"))
+DEMAND_HEATMAP_GRID_SIZE = float(os.getenv("MYUBER_DEMAND_HEATMAP_GRID_SIZE", "0.01"))
+FRAUD_RECENT_WINDOW_MINUTES = parse_int_env("MYUBER_FRAUD_RECENT_WINDOW_MINUTES", "15")
+FRAUD_REVIEW_SCORE = parse_int_env("MYUBER_FRAUD_REVIEW_SCORE", "60")
+FRAUD_BLOCK_SCORE = parse_int_env("MYUBER_FRAUD_BLOCK_SCORE", "90")
+LOG_LEVEL = os.getenv("MYUBER_LOG_LEVEL", "INFO").upper()
+RECEIPT_EMAIL_FROM = os.getenv("MYUBER_RECEIPT_EMAIL_FROM", "receipts@myuber.local")
+SMTP_HOST = os.getenv("MYUBER_SMTP_HOST")
+SMTP_PORT = int(os.getenv("MYUBER_SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("MYUBER_SMTP_USERNAME")
+SMTP_PASSWORD = os.getenv("MYUBER_SMTP_PASSWORD")
+SMTP_USE_TLS = os.getenv("MYUBER_SMTP_USE_TLS", "true").strip().lower() not in {"0", "false", "no"}
+SMTP_TIMEOUT_SECONDS = parse_float_env("MYUBER_SMTP_TIMEOUT_SECONDS", "10")
+PUSH_VAPID_PUBLIC_KEY = os.getenv("MYUBER_VAPID_PUBLIC_KEY")
+PUSH_VAPID_PRIVATE_KEY = os.getenv("MYUBER_VAPID_PRIVATE_KEY")
+PUSH_VAPID_SUBJECT = os.getenv("MYUBER_VAPID_SUBJECT", f"mailto:{DEFAULT_ADMIN_EMAIL}")
+AUDIT_LOG_MAX_EVENTS = parse_int_env("MYUBER_AUDIT_LOG_MAX_EVENTS", "1000")
+OBSERVABILITY_RECENT_REQUESTS = parse_int_env("MYUBER_OBSERVABILITY_RECENT_REQUESTS", "50")
+OBSERVABILITY_LATENCY_SAMPLES = parse_int_env("MYUBER_OBSERVABILITY_LATENCY_SAMPLES", "500")
 
+ADMIN_PERMISSIONS = {
+    "admin.dashboard.read": {
+        "id": "admin.dashboard.read",
+        "label": "View operations dashboard",
+        "description": "Read operational totals, live rides, demand, and management summaries.",
+    },
+    "admin.users.manage": {
+        "id": "admin.users.manage",
+        "label": "Manage accounts",
+        "description": "Suspend and reactivate rider or driver accounts.",
+    },
+    "admin.drivers.manage": {
+        "id": "admin.drivers.manage",
+        "label": "Manage drivers",
+        "description": "Force drivers offline and review driver documents.",
+    },
+    "admin.fraud.read": {
+        "id": "admin.fraud.read",
+        "label": "View fraud events",
+        "description": "Read risk events and fraud review signals.",
+    },
+    "admin.audit.read": {
+        "id": "admin.audit.read",
+        "label": "View audit logs",
+        "description": "Read security and administrative activity logs.",
+    },
+    "admin.observability.read": {
+        "id": "admin.observability.read",
+        "label": "View observability",
+        "description": "Read API latency, error, storage, background job, and websocket health.",
+    },
+}
+
+ADMIN_ROLE_DEFINITIONS = {
+    "super_admin": {
+        "id": "super_admin",
+        "label": "Super admin",
+        "permissions": sorted(ADMIN_PERMISSIONS),
+    },
+    "operations": {
+        "id": "operations",
+        "label": "Operations",
+        "permissions": [
+            "admin.dashboard.read",
+            "admin.users.manage",
+            "admin.drivers.manage",
+            "admin.fraud.read",
+            "admin.observability.read",
+        ],
+    },
+    "support": {
+        "id": "support",
+        "label": "Support",
+        "permissions": [
+            "admin.dashboard.read",
+            "admin.audit.read",
+        ],
+    },
+}
+
+ROLE_PERMISSIONS = {
+    "rider": [
+        "rides.request",
+        "rides.view_own",
+        "rides.cancel_own",
+        "rides.share_own",
+        "wallet.manage_own",
+        "notifications.manage_own",
+    ],
+    "driver": [
+        "drivers.location.write",
+        "drivers.availability.write",
+        "rides.accept_assigned",
+        "rides.progress_assigned",
+        "rides.view_assigned",
+        "earnings.view_own",
+        "notifications.manage_own",
+    ],
+}
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 logger = logging.getLogger("myuber")
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+if USING_GENERATED_SECRET_KEY:
+    logger.warning("MYUBER_SECRET_KEY is not set; generated a temporary in-memory JWT secret")
+
+if USING_GENERATED_ADMIN_PASSWORD:
+    logger.warning("MYUBER_ADMIN_PASSWORD is not set; generated a temporary admin password for this process")
+
+if PUSH_VAPID_PUBLIC_KEY and PUSH_VAPID_PRIVATE_KEY and webpush is None:
+    logger.warning("VAPID push keys are configured but pywebpush is not installed; push delivery is disabled")
+
+
+def request_id_for(request: Request) -> str:
+    return getattr(request.state, "request_id", None) or uuid4().hex
+
+
+def error_response(
+    request: Request,
+    status_code: int,
+    detail,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    request_id = request_id_for(request)
+    response_headers = {"X-Request-ID": request_id}
+    if headers:
+        response_headers.update(headers)
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": detail, "request_id": request_id},
+        headers=response_headers,
+    )
+
+
+def client_ip_for(request: Request) -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",", 1)[0].strip() or "unknown"
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def rate_limit_rule_for(method: str, path: str) -> tuple[str, int, int] | None:
+    if path in {"/", "/health/storage", "/vehicle-types"}:
+        return None
+    if method == "POST" and path in {"/riders/login", "/drivers/login", "/admin/login"}:
+        return "auth-login", RATE_LIMIT_LOGIN_PER_MINUTE, 60
+    if method == "POST" and path in {"/riders/signup", "/drivers/signup"}:
+        return "auth-signup", RATE_LIMIT_SIGNUP_PER_HOUR, 3600
+    if method == "POST" and path in {"/auth/refresh", "/auth/logout"}:
+        return "auth-session", RATE_LIMIT_REFRESH_PER_MINUTE, 60
+    if method == "POST" and path == "/rides":
+        return "ride-create", RATE_LIMIT_RIDE_REQUESTS_PER_MINUTE, 60
+    if path == "/routes/estimate":
+        return "route-estimate", 60, 60
+    if path == "/search/locations":
+        return "location-search", 90, 60
+    if method == "GET":
+        return "read", RATE_LIMIT_READ_PER_MINUTE, 60
+    return "write", RATE_LIMIT_DEFAULT_PER_MINUTE, 60
+
+
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -72,18 +309,35 @@ admins: dict[str, dict] = {}
 rides: dict[str, dict] = {}
 issue_reports: dict[str, dict] = {}
 notifications: dict[str, dict] = {}
+push_subscriptions: dict[str, dict] = {}
 trip_shares: dict[str, dict] = {}
+refresh_tokens: dict[str, dict] = {}
+fraud_events: dict[str, dict] = {}
+audit_logs: dict[str, dict] = {}
 ride_connections: dict[str, list[WebSocket]] = {}
 driver_connections: dict[str, list[WebSocket]] = {}
 share_connections: dict[str, list[WebSocket]] = {}
 DEFAULT_DRIVER_LOCATION = {"lat": 51.5074, "lng": -0.1278}
 redis_client = None
 redis_subscriber_task: asyncio.Task | None = None
+scheduled_rides_task: asyncio.Task | None = None
 database_pool = None
 database_available = False
 postgis_available = False
+rate_limit_buckets: dict[str, dict] = {}
+observability_metrics: dict[str, object] = {
+    "total_requests": 0,
+    "status_counts": {},
+    "method_counts": {},
+    "route_metrics": {},
+    "latency_samples_ms": [],
+    "recent_requests": [],
+    "rate_limited_requests": 0,
+    "error_requests": 0,
+}
 
 RIDE_STATUSES = {
+    "scheduled",
     "matching",
     "pending_driver",
     "accepted",
@@ -94,8 +348,10 @@ RIDE_STATUSES = {
     "no_drivers_available",
 }
 TERMINAL_RIDE_STATUSES = {"completed", "cancelled"}
+RIDE_QUEUE_STATUSES = {"matching", "no_drivers_available"}
 DRIVER_PROGRESS_STATUSES = {"arrived", "in_progress", "completed"}
 RIDER_CANCELABLE_STATUSES = {
+    "scheduled",
     "matching",
     "pending_driver",
     "accepted",
@@ -104,6 +360,7 @@ RIDER_CANCELABLE_STATUSES = {
 }
 DRIVER_CANCELABLE_STATUSES = {"accepted", "arrived"}
 ALLOWED_RIDE_TRANSITIONS = {
+    "scheduled": {"matching", "cancelled"},
     "matching": {"pending_driver", "no_drivers_available", "cancelled"},
     "no_drivers_available": {"matching", "pending_driver", "cancelled"},
     "pending_driver": {"matching", "accepted", "no_drivers_available", "cancelled"},
@@ -114,6 +371,7 @@ ALLOWED_RIDE_TRANSITIONS = {
     "cancelled": set(),
 }
 RIDE_STATUS_TIMESTAMPS = {
+    "scheduled": "scheduled_at",
     "pending_driver": "matched_at",
     "accepted": "accepted_at",
     "arrived": "arrived_at",
@@ -123,6 +381,7 @@ RIDE_STATUS_TIMESTAMPS = {
     "no_drivers_available": "no_drivers_available_at",
 }
 ACCOUNT_STATUSES = {"active", "suspended"}
+
 
 Location = TypedDict("Location", {"lat": float, "lng": float})
 
@@ -143,20 +402,34 @@ DriverSignup = TypedDict(
         "vehicle_year": int,
         "vehicle_color": str,
         "vehicle_plate": str,
+        "vehicle_type": NotRequired[str],
         "license_number": str,
     },
 )
 
 LoginRequest = TypedDict("LoginRequest", {"email": str, "password": str})
+RefreshTokenRequest = TypedDict("RefreshTokenRequest", {"refresh_token": str})
 
 RideRequest = TypedDict(
     "RideRequest",
-    {"rider_id": str, "pickup": Location, "destination": Location},
+    {
+        "rider_id": str,
+        "pickup": Location,
+        "destination": Location,
+        "vehicle_type": NotRequired[str],
+        "scheduled_for": NotRequired[str],
+        "promo_code": NotRequired[str],
+    },
 )
 
 RouteEstimateRequest = TypedDict(
     "RouteEstimateRequest",
-    {"pickup": Location, "destination": Location},
+    {
+        "pickup": Location,
+        "destination": Location,
+        "vehicle_type": NotRequired[str],
+        "promo_code": NotRequired[str],
+    },
 )
 
 DriverLocationRequest = TypedDict("DriverLocationRequest", {"location": Location})
@@ -169,12 +442,29 @@ RideIssueReportRequest = TypedDict(
     {"category": str, "description": str},
 )
 NotificationReadRequest = TypedDict("NotificationReadRequest", {"read": bool})
+PushSubscriptionKeys = TypedDict("PushSubscriptionKeys", {"p256dh": str, "auth": str})
+PushSubscriptionRequest = TypedDict(
+    "PushSubscriptionRequest",
+    {
+        "endpoint": str,
+        "keys": PushSubscriptionKeys,
+        "expirationTime": NotRequired[float | None],
+    },
+)
+WalletTopUpRequest = TypedDict("WalletTopUpRequest", {"amount": float})
 AdminUserStatusRequest = TypedDict("AdminUserStatusRequest", {"status": str})
+AdminDriverDocumentsRequest = TypedDict("AdminDriverDocumentsRequest", {"status": str})
 
 location_adapter = TypeAdapter(Location)
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def vehicle_type_config(vehicle_type: str | None) -> dict:
+    return VEHICLE_TYPES.get(vehicle_type or DEFAULT_VEHICLE_TYPE, VEHICLE_TYPES[DEFAULT_VEHICLE_TYPE])
+
+
 
 
 def ensure_default_admin() -> None:
@@ -189,6 +479,8 @@ def ensure_default_admin() -> None:
         "name": "MyUber Admin",
         "phone": "",
         "role": "admin",
+        "admin_role": "super_admin",
+        "permissions": sorted(ADMIN_PERMISSIONS),
         "account_status": "active",
         "created_at": now_iso(),
     }
@@ -205,7 +497,11 @@ def runtime_state_payload() -> dict:
         "rides": rides,
         "issue_reports": issue_reports,
         "notifications": notifications,
+        "push_subscriptions": push_subscriptions,
         "trip_shares": trip_shares,
+        "refresh_tokens": refresh_tokens,
+        "fraud_events": fraud_events,
+        "audit_logs": audit_logs,
     }
 
 
@@ -217,7 +513,11 @@ def restore_runtime_state(payload: dict) -> None:
         "rides": rides,
         "issue_reports": issue_reports,
         "notifications": notifications,
+        "push_subscriptions": push_subscriptions,
         "trip_shares": trip_shares,
+        "refresh_tokens": refresh_tokens,
+        "fraud_events": fraud_events,
+        "audit_logs": audit_logs,
     }
 
     for key, store in stores.items():
@@ -315,6 +615,8 @@ async def sync_driver_location_index(connection=None) -> None:
 
     rows = []
     for driver in drivers.values():
+        if not driver_can_receive_requests(driver):
+            continue
         location = parse_location_payload(driver.get("location"))
         if not location:
             continue
@@ -458,7 +760,84 @@ def storage_status() -> dict:
             "connected": redis_client is not None,
             "cache_ttl_seconds": REDIS_CACHE_TTL_SECONDS,
         },
+        "routing": routing_status(),
+        "security": security_status(),
     }
+
+
+def active_routing_provider() -> str:
+    if ROUTING_PROVIDER in {"osrm", "graphhopper"}:
+        return ROUTING_PROVIDER
+    return "osrm"
+
+
+def routing_status() -> dict:
+    provider = active_routing_provider()
+    return {
+        "provider": provider,
+        "configured_provider": ROUTING_PROVIDER,
+        "timeout_seconds": ROUTING_TIMEOUT_SECONDS,
+        "osrm": {
+            "base_url": OSRM_BASE_URL,
+            "profile": OSRM_PROFILE,
+        },
+        "graphhopper": {
+            "base_url": GRAPHHOPPER_BASE_URL,
+            "profile": GRAPHHOPPER_PROFILE,
+            "api_key_configured": bool(GRAPHHOPPER_API_KEY),
+        },
+    }
+
+
+def security_status() -> dict:
+    return {
+        "rate_limiting": {
+            "enabled": RATE_LIMIT_ENABLED,
+            "default_per_minute": RATE_LIMIT_DEFAULT_PER_MINUTE,
+            "read_per_minute": RATE_LIMIT_READ_PER_MINUTE,
+            "login_per_minute": RATE_LIMIT_LOGIN_PER_MINUTE,
+            "ride_requests_per_minute": RATE_LIMIT_RIDE_REQUESTS_PER_MINUTE,
+        },
+        "auth": {
+            "access_token_expire_minutes": ACCESS_TOKEN_EXPIRE_MINUTES,
+            "refresh_token_expire_days": REFRESH_TOKEN_EXPIRE_DAYS,
+        },
+        "access_control": role_permission_summary(),
+        "fraud": {
+            "review_score": FRAUD_REVIEW_SCORE,
+            "block_score": FRAUD_BLOCK_SCORE,
+            "recent_window_minutes": FRAUD_RECENT_WINDOW_MINUTES,
+        },
+    }
+
+
+def normalize_observability_path(path: str) -> str:
+    normalized_segments = []
+    for segment in path.strip("/").split("/"):
+        if not segment:
+            continue
+        hex_like = all(character in "0123456789abcdefABCDEF-" for character in segment)
+        if segment.isdigit() or (len(segment) >= 16 and hex_like):
+            normalized_segments.append("{id}")
+        else:
+            normalized_segments.append(segment)
+    return "/" + "/".join(normalized_segments) if normalized_segments else "/"
+
+
+def bounded_append(items: list, item, limit: int) -> None:
+    items.append(item)
+    if len(items) > max(limit, 1):
+        del items[: len(items) - max(limit, 1)]
+
+
+def percentile(values: list[float], percentile_value: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round((percentile_value / 100) * (len(ordered) - 1))))
+    return round(float(ordered[index]), 2)
+
+
 
 
 def normalized_account_status(user: dict | None) -> str:
@@ -478,6 +857,9 @@ def is_account_active(user: dict | None) -> bool:
 def ensure_account_active(user: dict | None) -> None:
     if not is_account_active(user):
         raise HTTPException(status_code=403, detail="Account is suspended")
+
+
+
 
 
 def format_status(status: str | None) -> str:
@@ -528,6 +910,12 @@ def set_ride_status(
     if timestamp_field:
         ride[timestamp_field] = changed_at
 
+    if next_status in RIDE_QUEUE_STATUSES:
+        ride.setdefault("queued_at", changed_at)
+    else:
+        ride["queue_position"] = None
+        ride["queue_size"] = None
+
     ride.setdefault("status_history", []).append(
         {
             "from": previous_status,
@@ -547,15 +935,7 @@ def release_driver_for_ride(ride: dict, availability: str = "available") -> None
     if driver.get("current_ride_id") == ride.get("id"):
         driver["current_ride_id"] = None
     if driver.get("availability") != "offline":
-        driver["availability"] = availability
-
-
-def create_token(data: dict) -> str:
-    to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
+        driver["availability"] = availability if driver_can_receive_requests(driver) else "offline"
 
 def decode_auth_token(token: str | None) -> dict:
     if token is None:
@@ -564,8 +944,11 @@ def decode_auth_token(token: str | None) -> dict:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
         role: str = payload.get("role")
+        token_type = payload.get("typ", "access")
         if user_id is None or role is None:
             raise HTTPException(status_code=401, detail="Invalid token")
+        if token_type != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
         return {"user_id": user_id, "role": role}
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -596,22 +979,26 @@ def haversine_km(start: Location, end: Location) -> float:
     return 2 * earth_radius_km * asin(sqrt(a))
 
 
-def active_demand_count() -> int:
+def active_demand_count(vehicle_type: str | None = None) -> int:
+    normalized_vehicle_type = vehicle_type if vehicle_type in VEHICLE_TYPES else None
     return sum(
         1
         for ride in rides.values()
         if ride.get("status") in {"matching", "pending_driver", "no_drivers_available"}
+        and (normalized_vehicle_type is None or ride_vehicle_type(ride) == normalized_vehicle_type)
     )
 
 
-def available_driver_count() -> int:
+def available_driver_count(vehicle_type: str | None = None) -> int:
+    normalized_vehicle_type = vehicle_type if vehicle_type in VEHICLE_TYPES else None
     return sum(
         1
         for driver in drivers.values()
-        if is_account_active(driver)
+        if driver_can_receive_requests(driver)
         and driver.get("availability") == "available"
         and not driver.get("current_ride_id")
         and parse_location_payload(driver.get("location"))
+        and (normalized_vehicle_type is None or driver_vehicle_type(driver) == normalized_vehicle_type)
     )
 
 
@@ -625,9 +1012,10 @@ def demand_level_for(multiplier: float) -> str:
     return "normal"
 
 
-def surge_pricing_state() -> dict:
-    demand = active_demand_count()
-    supply = available_driver_count()
+def surge_pricing_state(vehicle_type: str | None = None) -> dict:
+    normalized_vehicle_type = vehicle_type if vehicle_type in VEHICLE_TYPES else None
+    demand = active_demand_count(normalized_vehicle_type)
+    supply = available_driver_count(normalized_vehicle_type)
     projected_demand = demand + 1
 
     if supply == 0 and demand == 0:
@@ -649,22 +1037,36 @@ def surge_pricing_state() -> dict:
         ),
         "active_demand": demand,
         "available_drivers": supply,
+        "vehicle_type": normalized_vehicle_type,
     }
 
 
-def fare_breakdown_for(distance_km: float, duration_min: float) -> dict:
+
+
+def fare_breakdown_for(
+    distance_km: float,
+    duration_min: float,
+    vehicle_type: str | None = None,
+    promo_code: str | None = None,
+) -> dict:
+    normalized_vehicle_type = normalize_vehicle_type(vehicle_type)
+    vehicle_config = vehicle_type_config(normalized_vehicle_type)
     distance_miles = max(0, distance_km) * 0.621371
     billable_minutes = max(0, duration_min)
     distance_charge = round(distance_miles * PER_MILE_RATE, 2)
     time_charge = round(billable_minutes * PER_MINUTE_RATE, 2)
     subtotal = round(BASE_FARE + distance_charge + time_charge, 2)
-    surge = surge_pricing_state()
+    surge = surge_pricing_state(normalized_vehicle_type)
     surge_multiplier = surge["surge_multiplier"]
     surge_charge = round(subtotal * (surge_multiplier - 1), 2)
     surged_subtotal = round(subtotal + surge_charge, 2)
-    minimum_adjustment = round(max(MINIMUM_FARE - surged_subtotal, 0), 2)
-    total = round(surged_subtotal + minimum_adjustment, 2)
-    return {
+    vehicle_multiplier = float(vehicle_config["fare_multiplier"])
+    vehicle_charge = round(surged_subtotal * (vehicle_multiplier - 1), 2)
+    vehicle_subtotal = round(surged_subtotal + vehicle_charge, 2)
+    minimum_adjustment = round(max(MINIMUM_FARE - vehicle_subtotal, 0), 2)
+    total = round(vehicle_subtotal + minimum_adjustment, 2)
+    return apply_promo_to_breakdown(
+        {
         "currency": FARE_CURRENCY,
         "base_fare": BASE_FARE,
         "distance_charge": distance_charge,
@@ -672,6 +1074,10 @@ def fare_breakdown_for(distance_km: float, duration_min: float) -> dict:
         "subtotal": subtotal,
         "surge_multiplier": surge_multiplier,
         "surge_charge": surge_charge,
+        "vehicle_type": normalized_vehicle_type,
+        "vehicle_type_label": vehicle_config["label"],
+        "vehicle_multiplier": vehicle_multiplier,
+        "vehicle_charge": vehicle_charge,
         "surge_reason": surge["surge_reason"],
         "demand_level": surge["demand_level"],
         "active_demand": surge["active_demand"],
@@ -683,26 +1089,30 @@ def fare_breakdown_for(distance_km: float, duration_min: float) -> dict:
         "distance_rate_per_mile": PER_MILE_RATE,
         "time_rate_per_minute": PER_MINUTE_RATE,
         "minimum_fare": MINIMUM_FARE,
-    }
+        },
+        promo_code,
+    )
 
-
-def fare_for(distance_km: float, duration_min: float) -> float:
-    return fare_breakdown_for(distance_km, duration_min)["total"]
 
 
 def create_mock_payment(
     ride_id: str,
+    rider_id: str,
     amount: float,
     created_at: str,
     fare_breakdown: dict | None = None,
 ) -> dict:
     payment_id = f"mock_{uuid4().hex[:12]}"
+    authorized_amount = money(amount)
     return {
         "id": payment_id,
         "ride_id": ride_id,
-        "amount": amount,
+        "rider_id": rider_id,
+        "amount": authorized_amount,
+        "authorized_amount": authorized_amount,
+        "original_amount": authorized_amount,
         "currency": FARE_CURRENCY,
-        "method": "Mock Visa ending 4242",
+        "method": "Wallet balance",
         "status": "authorized",
         "authorization_code": f"AUTH-{uuid4().hex[:8].upper()}",
         "authorized_at": created_at,
@@ -714,18 +1124,30 @@ def create_mock_payment(
     }
 
 
+
+
 def capture_mock_payment(ride: dict) -> None:
     payment = ride.get("payment")
-    if not payment or payment.get("status") == "paid":
+    if not payment or payment.get("status") in {"paid", "voided", "refunded"}:
         return
 
     captured_at = now_iso()
+    transaction = wallet_transaction(
+        ride["rider_id"],
+        transaction_type="ride_payment",
+        amount=-money(payment.get("amount")),
+        description="Ride fare",
+        ride_id=ride["id"],
+        payment_id=payment["id"],
+    )
     payment["status"] = "paid"
     payment["captured_at"] = captured_at
-    payment["receipt_number"] = f"RCPT-{uuid4().hex[:10].upper()}"
+    payment["receipt_number"] = payment.get("receipt_number") or generate_receipt_number()
     payment["voided_at"] = None
+    payment["wallet_transaction_id"] = transaction["id"]
     ride["payment"] = payment
     ride["updated_at"] = captured_at
+    ensure_receipt_for_ride(ride)
 
 
 def void_mock_payment(ride: dict, reason: str) -> None:
@@ -741,6 +1163,8 @@ def void_mock_payment(ride: dict, reason: str) -> None:
     ride["updated_at"] = voided_at
 
 
+
+
 def refund_mock_payment(ride: dict, reason: str) -> bool:
     payment = ride.get("payment")
     if not payment:
@@ -751,15 +1175,25 @@ def refund_mock_payment(ride: dict, reason: str) -> bool:
         raise HTTPException(status_code=409, detail="Only paid rides can be refunded")
 
     refunded_at = now_iso()
+    refund_amount = money(payment.get("amount"))
+    transaction = wallet_transaction(
+        ride["rider_id"],
+        transaction_type="refund",
+        amount=refund_amount,
+        description="Ride refund",
+        ride_id=ride["id"],
+        payment_id=payment["id"],
+    )
     refund = {
         "id": f"rfnd_{uuid4().hex[:12]}",
         "ride_id": ride["id"],
         "payment_id": payment["id"],
-        "amount": round(float(payment.get("amount") or 0), 2),
+        "amount": refund_amount,
         "currency": payment.get("currency", FARE_CURRENCY),
         "status": "succeeded",
         "reason": reason,
         "created_at": refunded_at,
+        "wallet_transaction_id": transaction["id"],
     }
     payment["status"] = "refunded"
     payment["refunded_at"] = refunded_at
@@ -767,6 +1201,7 @@ def refund_mock_payment(ride: dict, reason: str) -> bool:
     ride["payment"] = payment
     ride["refund"] = refund
     ride["updated_at"] = refunded_at
+    ensure_receipt_for_ride(ride)
     return True
 
 
@@ -776,21 +1211,38 @@ def build_route_estimate(
     route: list[dict],
     source: str,
     steps: list[dict] | None = None,
+    vehicle_type: str | None = None,
+    promo_code: str | None = None,
 ) -> dict:
-    fare_breakdown = fare_breakdown_for(distance_km, duration_min)
+    normalized_vehicle_type = normalize_vehicle_type(vehicle_type)
+    normalized_promo_code = normalize_promo_code(promo_code)
+    fare_breakdown = fare_breakdown_for(
+        distance_km,
+        duration_min,
+        normalized_vehicle_type,
+        normalized_promo_code,
+    )
     return {
         "distance_km": round(distance_km, 2),
         "duration_min": max(1, round(duration_min)),
         "currency": FARE_CURRENCY,
         "fare": fare_breakdown["total"],
         "fare_breakdown": fare_breakdown,
+        "vehicle_type": normalized_vehicle_type,
+        "vehicle_type_label": vehicle_type_config(normalized_vehicle_type)["label"],
+        "promo_code": normalized_promo_code,
         "route": route,
         "steps": steps or [],
         "source": source,
     }
 
 
-def fallback_route_estimate(pickup: Location, destination: Location) -> dict:
+def fallback_route_estimate(
+    pickup: Location,
+    destination: Location,
+    vehicle_type: str | None = None,
+    promo_code: str | None = None,
+) -> dict:
     straight_line_km = haversine_km(pickup, destination)
     driving_distance_km = straight_line_km * 1.28
     duration_min = (driving_distance_km / 32) * 60
@@ -817,6 +1269,8 @@ def fallback_route_estimate(pickup: Location, destination: Location) -> dict:
                 "location": route[-1],
             },
         ],
+        vehicle_type,
+        promo_code,
     )
 
 
@@ -837,7 +1291,11 @@ def cached_route_payload(estimate: dict) -> dict:
     }
 
 
-def route_estimate_from_cached_payload(payload: dict) -> dict | None:
+def route_estimate_from_cached_payload(
+    payload: dict,
+    vehicle_type: str | None = None,
+    promo_code: str | None = None,
+) -> dict | None:
     try:
         return build_route_estimate(
             float(payload["distance_km"]),
@@ -845,6 +1303,8 @@ def route_estimate_from_cached_payload(payload: dict) -> dict | None:
             list(payload["route"]),
             str(payload.get("source") or "cache"),
             list(payload.get("steps") or []),
+            vehicle_type,
+            promo_code,
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -930,6 +1390,8 @@ def steps_from_osrm_legs(legs: list) -> list[dict]:
     return route_steps
 
 
+
+
 def rating_summary_for_user(user_id: str) -> dict:
     scores: list[int] = []
     for ride in rides.values():
@@ -949,12 +1411,20 @@ def rating_summary_for_user(user_id: str) -> dict:
 def public_driver(driver: dict | None) -> dict | None:
     if not driver:
         return None
+    ensure_driver_document_state(driver)
     rating_summary = rating_summary_for_user(driver["id"])
+    vehicle = driver.get("vehicle")
+    if isinstance(vehicle, dict):
+        vehicle = {
+            **vehicle,
+            "type": driver_vehicle_type(driver),
+            "type_label": vehicle_type_config(driver_vehicle_type(driver))["label"],
+        }
     return {
         "id": driver["id"],
         "name": driver["name"],
         "phone": driver["phone"],
-        "vehicle": driver.get("vehicle"),
+        "vehicle": vehicle,
         "location": driver.get("location"),
         **rating_summary,
     }
@@ -967,6 +1437,9 @@ def public_ride(ride: dict) -> dict:
         for key, value in ride.items()
         if key != "declined_driver_ids"
     }
+    vehicle_type = ride_vehicle_type(ride)
+    serialized["vehicle_type"] = vehicle_type
+    serialized["vehicle_type_label"] = vehicle_type_config(vehicle_type)["label"]
     serialized["driver"] = public_driver(driver)
     return serialized
 
@@ -974,10 +1447,18 @@ def public_ride(ride: dict) -> dict:
 def public_shared_driver(driver: dict | None) -> dict | None:
     if not driver:
         return None
+    ensure_driver_document_state(driver)
     rating_summary = rating_summary_for_user(driver["id"])
+    vehicle = driver.get("vehicle")
+    if isinstance(vehicle, dict):
+        vehicle = {
+            **vehicle,
+            "type": driver_vehicle_type(driver),
+            "type_label": vehicle_type_config(driver_vehicle_type(driver))["label"],
+        }
     return {
         "name": driver["name"],
-        "vehicle": driver.get("vehicle"),
+        "vehicle": vehicle,
         "location": driver.get("location"),
         **rating_summary,
     }
@@ -992,11 +1473,14 @@ def public_shared_ride(ride: dict) -> dict:
         "destination": ride.get("destination"),
         "distance_km": ride.get("distance_km"),
         "duration_min": ride.get("duration_min"),
+        "vehicle_type": ride_vehicle_type(ride),
+        "vehicle_type_label": vehicle_type_config(ride_vehicle_type(ride))["label"],
         "driver_location": ride.get("driver_location"),
         "rider_location": ride.get("rider_location"),
         "driver": public_shared_driver(driver),
         "created_at": ride.get("created_at"),
         "updated_at": ride.get("updated_at"),
+        "scheduled_for": ride.get("scheduled_for"),
         "matched_at": ride.get("matched_at"),
         "accepted_at": ride.get("accepted_at"),
         "arrived_at": ride.get("arrived_at"),
@@ -1008,14 +1492,34 @@ def public_shared_ride(ride: dict) -> dict:
 
 def safe_user(user: dict) -> dict:
     normalized_account_status(user)
+    if user.get("role") == "driver":
+        ensure_driver_document_state(user)
+    if user.get("role") == "rider":
+        ensure_rider_wallet(user)
+    if user.get("role") == "admin":
+        normalized_admin_role(user)
+        admin_permissions_for(user)
     serialized = {k: v for k, v in user.items() if k != "password_hash"}
+    if user.get("role") == "rider":
+        serialized["wallet"] = public_wallet(user)
+    serialized["permissions"] = permissions_for_user_record(user)
     serialized.update(rating_summary_for_user(user["id"]))
     return serialized
 
 
 def require_role(current_user: dict, role: str) -> str:
     if current_user["role"] != role:
+        record_audit_event(
+            action="access.role_denied",
+            actor=current_user,
+            target_type="role",
+            target_id=role,
+            outcome="denied",
+        )
         raise HTTPException(status_code=403, detail=f"{role.title()} account required")
+    user = user_for_auth(current_user.get("user_id"), current_user.get("role"))
+    if user:
+        ensure_account_active(user)
     return current_user["user_id"]
 
 
@@ -1027,6 +1531,9 @@ def can_view_ride(current_user: dict, ride: dict) -> bool:
     if current_user["role"] == "driver":
         return ride.get("driver_id") == current_user["user_id"]
     return False
+
+
+
 
 
 def rating_target_for(current_user: dict, ride: dict) -> tuple[str, str]:
@@ -1151,6 +1658,10 @@ def unread_notifications_count(user_id: str, role: str) -> int:
     )
 
 
+
+
+
+
 async def notify_rider(ride: dict, title: str, body: str, kind: str) -> None:
     rider_id = ride.get("rider_id")
     if not rider_id:
@@ -1165,6 +1676,7 @@ async def notify_rider(ride: dict, title: str, body: str, kind: str) -> None:
             "unread_count": unread_notifications_count(rider_id, "rider"),
         },
     )
+    await dispatch_push_notification(notification)
 
 
 async def notify_driver(driver_id: str, title: str, body: str, kind: str, ride_id: str | None = None) -> None:
@@ -1177,6 +1689,7 @@ async def notify_driver(driver_id: str, title: str, body: str, kind: str, ride_i
             "unread_count": unread_notifications_count(driver_id, "driver"),
         },
     )
+    await dispatch_push_notification(notification)
 
 
 def rider_name_for_ride(ride: dict) -> str:
@@ -1201,6 +1714,7 @@ def user_summary(user: dict | None) -> dict | None:
 
 def admin_ride_summary(ride: dict) -> dict:
     payment = ride.get("payment") or {}
+    vehicle_type = ride_vehicle_type(ride)
     return {
         "id": ride["id"],
         "status": ride.get("status"),
@@ -1210,19 +1724,35 @@ def admin_ride_summary(ride: dict) -> dict:
         "destination": ride.get("destination"),
         "driver_location": ride.get("driver_location"),
         "rider_location": ride.get("rider_location"),
+        "dispatch_expires_at": ride.get("dispatch_expires_at"),
+        "dispatch_timeout_seconds": ride.get("dispatch_timeout_seconds"),
         "distance_km": ride.get("distance_km"),
         "duration_min": ride.get("duration_min"),
+        "vehicle_type": vehicle_type,
+        "vehicle_type_label": vehicle_type_config(vehicle_type)["label"],
         "fare": ride.get("fare"),
         "currency": ride.get("currency", FARE_CURRENCY),
         "payment_status": payment.get("status"),
+        "fraud_assessment": ride.get("fraud_assessment"),
+        "queue_position": ride.get("queue_position"),
+        "queue_size": ride.get("queue_size"),
+        "scheduled_for": ride.get("scheduled_for"),
         "created_at": ride.get("created_at"),
         "updated_at": ride.get("updated_at"),
     }
 
 
 def admin_driver_summary(driver: dict) -> dict:
+    document_verification = ensure_driver_document_state(driver)
     earnings = build_driver_earnings(driver["id"])
     rating_summary = rating_summary_for_user(driver["id"])
+    vehicle = driver.get("vehicle")
+    if isinstance(vehicle, dict):
+        vehicle = {
+            **vehicle,
+            "type": driver_vehicle_type(driver),
+            "type_label": vehicle_type_config(driver_vehicle_type(driver))["label"],
+        }
     return {
         "id": driver["id"],
         "name": driver["name"],
@@ -1232,8 +1762,9 @@ def admin_driver_summary(driver: dict) -> dict:
         "availability": driver.get("availability"),
         "current_ride_id": driver.get("current_ride_id"),
         "location": driver.get("location"),
-        "vehicle": driver.get("vehicle"),
+        "vehicle": vehicle,
         "onboarding_status": driver.get("onboarding_status"),
+        "document_verification": document_verification,
         "acceptance_rate": earnings["acceptance_rate"],
         "today_net": earnings["today_net"],
         "completed_rides": earnings["completed_rides"],
@@ -1259,14 +1790,23 @@ def admin_user_summary(user: dict) -> dict:
     }
 
     if role == "driver":
+        document_verification = ensure_driver_document_state(summary)
         earnings = build_driver_earnings(summary["id"])
+        vehicle = summary.get("vehicle")
+        if isinstance(vehicle, dict):
+            vehicle = {
+                **vehicle,
+                "type": driver_vehicle_type(summary),
+                "type_label": vehicle_type_config(driver_vehicle_type(summary))["label"],
+            }
         result.update(
             {
                 "availability": summary.get("availability"),
                 "current_ride_id": summary.get("current_ride_id"),
-                "vehicle": summary.get("vehicle"),
+                "vehicle": vehicle,
                 "location": summary.get("location"),
                 "onboarding_status": summary.get("onboarding_status"),
+                "document_verification": document_verification,
                 "acceptance_rate": earnings["acceptance_rate"],
                 "today_net": earnings["today_net"],
                 "completed_rides": earnings["completed_rides"],
@@ -1290,6 +1830,7 @@ def admin_issue_summary(report: dict) -> dict:
         **report,
         "ride": admin_ride_summary(ride) if ride else None,
     }
+
 
 
 def percentage(part: int | float, total: int | float) -> float:
@@ -1365,7 +1906,9 @@ def build_admin_analytics(
     }
 
 
-def build_admin_dashboard() -> dict:
+def build_admin_dashboard(current_user: dict | None = None) -> dict:
+    refresh_ride_queue()
+    current_permissions = permissions_for_current_user(current_user) if current_user else []
     completed_rides = [ride for ride in rides.values() if ride.get("status") == "completed"]
     active_rides = [
         ride
@@ -1387,6 +1930,16 @@ def build_admin_dashboard() -> dict:
     )
     refund_total = round(
         sum(float((payment.get("refund") or {}).get("amount") or 0) for payment in payments),
+        2,
+    )
+    platform_fee_total = round(
+        sum(
+            money(payment.get("amount"))
+            if payment.get("cancellation_fee")
+            else money(payment.get("amount")) * PLATFORM_FEE_RATE
+            for payment in payments
+            if payment.get("status") == "paid"
+        ),
         2,
     )
     recent_rides = sorted(rides.values(), key=lambda ride: ride.get("created_at", ""), reverse=True)[:8]
@@ -1421,11 +1974,28 @@ def build_admin_dashboard() -> dict:
         "revenue": {
             "gross_total": gross_total,
             "paid_total": paid_total,
-            "platform_fee_total": round(paid_total * PLATFORM_FEE_RATE, 2),
+            "platform_fee_total": platform_fee_total,
             "refund_total": refund_total,
             "platform_fee_rate": PLATFORM_FEE_RATE,
         },
+        "fraud": (
+            build_admin_fraud_summary()
+            if "admin.fraud.read" in current_permissions
+            else {"total_events": 0, "open_reviews": 0, "blocked_requests": 0, "risk_counts": {}, "top_signals": [], "recent_events": []}
+        ),
+        "audit": (
+            build_audit_summary()
+            if "admin.audit.read" in current_permissions
+            else {"total_events": 0, "action_counts": {}, "outcome_counts": {}, "recent_events": []}
+        ),
+        "observability": (
+            build_observability_dashboard()
+            if "admin.observability.read" in current_permissions
+            else None
+        ),
+        "access_control": build_access_control_summary(current_user),
         "demand": surge_pricing_state(),
+        "demand_heatmap": build_demand_heatmap(),
         "analytics": build_admin_analytics(
             completed_rides=completed_rides,
             active_rides=active_rides,
@@ -1548,6 +2118,8 @@ def active_ride_for_driver(driver_id: str) -> dict | None:
     return ride
 
 
+
+
 async def postgis_driver_candidates(ride: dict, pickup: Location) -> list[tuple[float, dict]] | None:
     if not database_pool or not postgis_available:
         return None
@@ -1569,7 +2141,7 @@ async def postgis_driver_candidates(ride: dict, pickup: Location) -> list[tuple[
                     AND account_status = 'active'
                     AND NOT (driver_id = ANY($3::text[]))
                 ORDER BY location <-> pickup.point
-                LIMIT 25
+                LIMIT 100
                 """,
                 float(pickup["lng"]),
                 float(pickup["lat"]),
@@ -1584,9 +2156,11 @@ async def postgis_driver_candidates(ride: dict, pickup: Location) -> list[tuple[
         driver = drivers.get(row["driver_id"])
         if not driver:
             continue
-        if not is_account_active(driver):
+        if not driver_can_receive_requests(driver):
             continue
         if driver.get("availability") != "available" or driver.get("current_ride_id"):
+            continue
+        if not driver_matches_ride_vehicle(driver, ride):
             continue
         candidates.append((float(row["distance_km"]), driver))
 
@@ -1606,13 +2180,15 @@ async def available_driver_candidates(ride: dict) -> list[tuple[float, dict]]:
     candidates: list[tuple[float, dict]] = []
 
     for driver in drivers.values():
-        if not is_account_active(driver):
+        if not driver_can_receive_requests(driver):
             continue
         if driver["id"] in declined:
             continue
         if driver.get("availability") != "available":
             continue
         if driver.get("current_ride_id"):
+            continue
+        if not driver_matches_ride_vehicle(driver, ride):
             continue
         if not driver.get("location"):
             continue
@@ -1704,9 +2280,11 @@ async def listen_for_redis_events() -> None:
 
 @app.on_event("startup")
 async def start_realtime_pubsub() -> None:
-    global redis_client, redis_subscriber_task
+    global redis_client, redis_subscriber_task, scheduled_rides_task
 
     await initialize_database()
+    refresh_ride_queue()
+    scheduled_rides_task = asyncio.create_task(scheduled_ride_loop())
 
     if not REDIS_URL:
         return
@@ -1727,7 +2305,13 @@ async def start_realtime_pubsub() -> None:
 
 @app.on_event("shutdown")
 async def stop_realtime_pubsub() -> None:
-    global redis_client, redis_subscriber_task
+    global redis_client, redis_subscriber_task, scheduled_rides_task
+
+    if scheduled_rides_task:
+        scheduled_rides_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await scheduled_rides_task
+        scheduled_rides_task = None
 
     if redis_subscriber_task:
         redis_subscriber_task.cancel()
@@ -1764,6 +2348,8 @@ async def broadcast_driver(driver_id: str, message: dict) -> None:
 async def assign_nearest_driver(ride: dict) -> dict | None:
     if ride.get("status") in TERMINAL_RIDE_STATUSES:
         return None
+    if ride.get("status") == "scheduled":
+        return None
 
     candidates = await available_driver_candidates(ride)
     if not candidates:
@@ -1771,11 +2357,15 @@ async def assign_nearest_driver(ride: dict) -> dict | None:
         ride["driver_id"] = None
         ride["driver_distance_km"] = None
         ride["driver_location"] = None
+        ride["dispatch_expires_at"] = None
+        ride.setdefault("queued_at", ride.get("created_at") or now_iso())
+        refresh_ride_queue()
         if changed:
+            vehicle_label = vehicle_type_config(ride_vehicle_type(ride))["label"]
             await notify_rider(
                 ride,
-                "No drivers available",
-                "No nearby online drivers are available right now.",
+                "Ride queued",
+                f"No nearby {vehicle_label} drivers are available right now. We will match the next available driver.",
                 "ride_no_drivers",
             )
         await persist_runtime_state()
@@ -1791,7 +2381,11 @@ async def assign_nearest_driver(ride: dict) -> dict | None:
     ride["driver_distance_km"] = round(distance, 2)
     ride["driver_location"] = driver.get("location")
     ride["matched_at"] = matched_at
+    ride["dispatch_expires_at"] = dispatch_deadline_for(matched_at)
+    ride["dispatch_timeout_seconds"] = DISPATCH_REQUEST_TIMEOUT_SECONDS
     ride["updated_at"] = matched_at
+    clear_ride_queue_metadata(ride)
+    refresh_ride_queue()
 
     await broadcast_driver(
         driver["id"],
@@ -1814,16 +2408,6 @@ async def assign_nearest_driver(ride: dict) -> dict | None:
     return driver
 
 
-async def assign_waiting_rides() -> None:
-    for ride in rides.values():
-        if ride.get("status") not in {"matching", "no_drivers_available"}:
-            continue
-        if ride.get("driver_id"):
-            continue
-        previous_status = ride["status"]
-        await assign_nearest_driver(ride)
-        if ride["status"] != previous_status:
-            await broadcast_ride(ride)
 
 
 async def update_driver_location_state(driver_id: str, location: dict) -> dict | None:
@@ -1835,12 +2419,17 @@ async def update_driver_location_state(driver_id: str, location: dict) -> dict |
         driver["current_ride_id"] = None
         await persist_runtime_state()
         return driver
+    active_ride = active_ride_for_driver(driver_id)
+    if not driver_documents_verified(driver) and not active_ride:
+        driver["availability"] = "offline"
+        driver["current_ride_id"] = None
+        await persist_runtime_state()
+        return driver
 
     now = datetime.now(timezone.utc).isoformat()
     driver["location"] = location
     driver["last_location_at"] = now
 
-    active_ride = active_ride_for_driver(driver_id)
     if active_ride:
         active_ride["driver_location"] = location
         active_ride["updated_at"] = now
@@ -1878,6 +2467,11 @@ async def set_driver_availability_state(driver_id: str, online: bool) -> dict | 
         await persist_runtime_state()
         raise HTTPException(status_code=403, detail="Account is suspended")
 
+    if online and not driver_documents_verified(driver):
+        driver["availability"] = "offline"
+        await persist_runtime_state()
+        raise HTTPException(status_code=403, detail="Driver documents must be verified before going online")
+
     if not online:
         if active_ride:
             ride_status = active_ride.get("status")
@@ -1897,6 +2491,7 @@ async def set_driver_availability_state(driver_id: str, online: bool) -> dict | 
             active_ride["driver_id"] = None
             active_ride["driver_distance_km"] = None
             active_ride["driver_location"] = None
+            active_ride["dispatch_expires_at"] = None
             set_ride_status(active_ride, "matching", "driver")
 
             await broadcast_driver(driver_id, {"type": "ride_cleared", "ride_id": active_ride["id"]})
@@ -1962,13 +2557,26 @@ def root():
 def health_storage():
     return storage_status()
 
+
+@app.get("/vehicle-types")
+def get_vehicle_types():
+    return public_vehicle_types()
+
+
 @app.post("/riders/signup")
-async def rider_signup(payload: RiderSignup):
+async def rider_signup(payload: RiderSignup, request: Request):
     for rider in riders.values():
         if rider["email"] == payload["email"]:
+            record_audit_event(
+                action="auth.rider_signup",
+                outcome="failure",
+                metadata={"email": payload["email"], "reason": "duplicate_email"},
+                request=request,
+            )
             raise HTTPException(status_code=400, detail="Email already registered")
 
     rider_id = str(uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
     rider = {
         "id": rider_id,
         "email": payload["email"],
@@ -1977,32 +2585,71 @@ async def rider_signup(payload: RiderSignup):
         "phone": payload["phone"],
         "role": "rider",
         "account_status": "active",
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "wallet": default_rider_wallet(created_at),
+        "created_at": created_at,
     }
     riders[rider_id] = rider
+    record_audit_event(
+        action="auth.rider_signup",
+        actor=rider,
+        target_type="rider",
+        target_id=rider_id,
+        request=request,
+    )
     await persist_runtime_state()
     return safe_user(rider)
 
 
 @app.post("/riders/login")
-def rider_login(payload: LoginRequest):
+async def rider_login(payload: LoginRequest, request: Request):
     for rider in riders.values():
         if rider["email"] == payload["email"]:
             if verify_password(payload["password"], rider["password_hash"]):
                 ensure_account_active(rider)
-                token = create_token({"sub": rider["id"], "role": "rider"})
-                return {"token": token, "user": safe_user(rider)}
+                response = auth_response(rider, "rider", request)
+                record_audit_event(
+                    action="auth.login",
+                    actor=rider,
+                    target_type="rider",
+                    target_id=rider["id"],
+                    metadata={"role": "rider"},
+                    request=request,
+                )
+                await persist_runtime_state()
+                return response
             else:
+                record_audit_event(
+                    action="auth.login",
+                    outcome="failure",
+                    target_type="rider",
+                    metadata={"email": payload["email"], "reason": "invalid_password"},
+                    request=request,
+                )
                 raise HTTPException(status_code=401, detail="Invalid password")
+    record_audit_event(
+        action="auth.login",
+        outcome="failure",
+        target_type="rider",
+        metadata={"email": payload["email"], "reason": "account_not_found"},
+        request=request,
+    )
     raise HTTPException(status_code=404, detail="Account not found")
 
 @app.post("/drivers/signup")
-async def driver_signup(payload: DriverSignup):
+async def driver_signup(payload: DriverSignup, request: Request):
     for driver in drivers.values():
         if driver["email"] == payload["email"]:
+            record_audit_event(
+                action="auth.driver_signup",
+                outcome="failure",
+                metadata={"email": payload["email"], "reason": "duplicate_email"},
+                request=request,
+            )
             raise HTTPException(status_code=400, detail="Email already registered")
 
+    vehicle_type = normalize_vehicle_type(payload.get("vehicle_type"))
     driver_id = str(uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
     driver = {
         "id": driver_id,
         "email": payload["email"],
@@ -2017,45 +2664,106 @@ async def driver_signup(payload: DriverSignup):
             "year": payload["vehicle_year"],
             "color": payload["vehicle_color"],
             "plate": payload["vehicle_plate"],
+            "type": vehicle_type,
+            "type_label": vehicle_type_config(vehicle_type)["label"],
         },
+        "vehicle_type": vehicle_type,
         "license_number": payload["license_number"],
-        "onboarding_status": "complete",
+        "document_verification": {
+            "documents": default_driver_documents(created_at, status="pending_review"),
+        },
+        "onboarding_status": "pending_review",
         "availability": "offline",
         "location": None,
         "current_ride_id": None,
-        "stats": {"accepted": 0, "rejected": 0},
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "stats": {"accepted": 0, "rejected": 0, "timed_out": 0},
+        "created_at": created_at,
     }
+    refresh_driver_document_summary(driver)
     drivers[driver_id] = driver
 
+    record_audit_event(
+        action="auth.driver_signup",
+        actor=driver,
+        target_type="driver",
+        target_id=driver_id,
+        request=request,
+    )
     await persist_runtime_state()
     return safe_user(driver)
 
 
 @app.post("/drivers/login")
-def driver_login(payload: LoginRequest):
+async def driver_login(payload: LoginRequest, request: Request):
     for driver in drivers.values():
         if driver["email"] == payload["email"]:
             if verify_password(payload["password"], driver["password_hash"]):
                 ensure_account_active(driver)
-                token = create_token({"sub": driver["id"], "role": "driver"})
-                return {"token": token, "user": safe_user(driver)}
+                response = auth_response(driver, "driver", request)
+                record_audit_event(
+                    action="auth.login",
+                    actor=driver,
+                    target_type="driver",
+                    target_id=driver["id"],
+                    metadata={"role": "driver"},
+                    request=request,
+                )
+                await persist_runtime_state()
+                return response
             else:
+                record_audit_event(
+                    action="auth.login",
+                    outcome="failure",
+                    target_type="driver",
+                    metadata={"email": payload["email"], "reason": "invalid_password"},
+                    request=request,
+                )
                 raise HTTPException(status_code=401, detail="Invalid password")
+    record_audit_event(
+        action="auth.login",
+        outcome="failure",
+        target_type="driver",
+        metadata={"email": payload["email"], "reason": "account_not_found"},
+        request=request,
+    )
     raise HTTPException(status_code=404, detail="Account not found")
 
 
 @app.post("/admin/login")
-def admin_login(payload: LoginRequest):
+async def admin_login(payload: LoginRequest, request: Request):
     ensure_default_admin()
     for admin in admins.values():
         if admin["email"] == payload["email"]:
             if verify_password(payload["password"], admin["password_hash"]):
                 ensure_account_active(admin)
-                token = create_token({"sub": admin["id"], "role": "admin"})
-                return {"token": token, "user": safe_user(admin)}
+                response = auth_response(admin, "admin", request)
+                record_audit_event(
+                    action="auth.login",
+                    actor=admin,
+                    target_type="admin",
+                    target_id=admin["id"],
+                    metadata={"role": "admin", "admin_role": normalized_admin_role(admin)},
+                    request=request,
+                )
+                await persist_runtime_state()
+                return response
+            record_audit_event(
+                action="auth.login",
+                outcome="failure",
+                target_type="admin",
+                metadata={"email": payload["email"], "reason": "invalid_password"},
+                request=request,
+            )
             raise HTTPException(status_code=401, detail="Invalid password")
+    record_audit_event(
+        action="auth.login",
+        outcome="failure",
+        target_type="admin",
+        metadata={"email": payload["email"], "reason": "account_not_found"},
+        request=request,
+    )
     raise HTTPException(status_code=404, detail="Account not found")
+
 
 
 @app.get("/auth/me")
@@ -2080,6 +2788,8 @@ def get_me(current_user: dict = Depends(get_current_user)):
     return safe_user(user)
 
 
+
+
 @app.get("/notifications")
 def get_notifications(current_user: dict = Depends(get_current_user)):
     user_notifications = notifications_for_current_user(current_user)
@@ -2087,6 +2797,12 @@ def get_notifications(current_user: dict = Depends(get_current_user)):
         "unread_count": unread_notifications_count(current_user["user_id"], current_user["role"]),
         "notifications": user_notifications,
     }
+
+
+
+
+
+
 
 
 @app.post("/notifications/{notification_id}/read")
@@ -2130,10 +2846,6 @@ async def mark_all_notifications_read(current_user: dict = Depends(get_current_u
     }
 
 
-@app.get("/admin/dashboard")
-def get_admin_dashboard(current_user: dict = Depends(get_current_user)):
-    require_role(current_user, "admin")
-    return build_admin_dashboard()
 
 
 def admin_target_user(role: str, user_id: str) -> dict:
@@ -2156,12 +2868,13 @@ async def update_admin_user_status(
     payload: AdminUserStatusRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    require_role(current_user, "admin")
+    require_permission(current_user, "admin.users.manage")
     status = payload.get("status")
     if status not in ACCOUNT_STATUSES:
         raise HTTPException(status_code=400, detail="Status must be active or suspended")
 
     user = admin_target_user(role, user_id)
+    previous_status = normalized_account_status(user)
     if role == "driver" and status == "suspended":
         await set_driver_availability_state(user_id, False)
 
@@ -2170,6 +2883,13 @@ async def update_admin_user_status(
     if role == "driver" and status == "suspended":
         user["availability"] = "offline"
 
+    record_audit_event(
+        action="admin.user_status.updated",
+        actor=current_user,
+        target_type=role,
+        target_id=user_id,
+        metadata={"previous_status": previous_status, "status": status},
+    )
     await persist_runtime_state()
     return admin_user_summary(user)
 
@@ -2179,15 +2899,24 @@ async def force_admin_driver_offline(
     driver_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    require_role(current_user, "admin")
+    require_permission(current_user, "admin.drivers.manage")
     driver = drivers.get(driver_id)
     if not driver:
         raise HTTPException(status_code=404, detail="Driver not found")
 
     await set_driver_availability_state(driver_id, False)
     driver["updated_at"] = now_iso()
+    record_audit_event(
+        action="admin.driver.force_offline",
+        actor=current_user,
+        target_type="driver",
+        target_id=driver_id,
+    )
     await persist_runtime_state()
     return admin_driver_summary(driver)
+
+
+
 
 
 @app.post("/drivers/location")
@@ -2221,8 +2950,9 @@ async def update_driver_availability(
 
 
 @app.get("/drivers/me/ride-request")
-def get_driver_ride_request(current_user: dict = Depends(get_current_user)):
+async def get_driver_ride_request(current_user: dict = Depends(get_current_user)):
     driver_id = require_role(current_user, "driver")
+    await assign_waiting_rides()
     ride = active_ride_for_driver(driver_id)
     if not ride:
         return None
@@ -2279,27 +3009,18 @@ async def search_locations(q: str):
     return locations
 
 
-async def calculate_route_estimate(pickup: Location, destination: Location) -> dict:
-    key = cache_key(
-        "route-estimate",
-        {
-            "profile": "driving",
-            "pickup": rounded_location_for_cache(pickup),
-            "destination": rounded_location_for_cache(destination),
-        },
-    )
-    cached = await cache_get_json(key)
-    if isinstance(cached, dict):
-        cached_estimate = route_estimate_from_cached_payload(cached)
-        if cached_estimate:
-            return cached_estimate
-
+async def estimate_route_with_osrm(
+    pickup: Location,
+    destination: Location,
+    vehicle_type: str | None = None,
+    promo_code: str | None = None,
+) -> dict | None:
     coords = f"{pickup['lng']},{pickup['lat']};{destination['lng']},{destination['lat']}"
 
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                f"https://router.project-osrm.org/route/v1/driving/{coords}",
+                f"{OSRM_BASE_URL}/route/v1/{OSRM_PROFILE}/{coords}",
                 params={
                     "overview": "full",
                     "geometries": "geojson",
@@ -2308,92 +3029,84 @@ async def calculate_route_estimate(pickup: Location, destination: Location) -> d
                 headers={
                     "User-Agent": "MyUber-Dev/1.0",
                 },
-                timeout=10.0,
+                timeout=ROUTING_TIMEOUT_SECONDS,
             )
     except httpx.HTTPError:
-        return fallback_route_estimate(pickup, destination)
+        return None
 
     if response.status_code != 200:
-        return fallback_route_estimate(pickup, destination)
+        return None
 
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+
     routes = data.get("routes", [])
     if not routes:
-        return fallback_route_estimate(pickup, destination)
+        return None
 
     route = routes[0]
-    geometry = route.get("geometry", {}).get("coordinates", [])
-    route_points = []
-    for coord in geometry:
-        if not isinstance(coord, (list, tuple)) or len(coord) < 2:
-            continue
-        lng, lat = coord[:2]
-        if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
-            route_points.append({"lat": lat, "lng": lng})
+    geometry = (route.get("geometry") or {}).get("coordinates", [])
+    route_points = route_points_from_coordinates(geometry)
 
     if len(route_points) < 2:
-        return fallback_route_estimate(pickup, destination)
+        return None
 
-    estimate = build_route_estimate(
+    return build_route_estimate(
         (route.get("distance") or 0) / 1000,
         (route.get("duration") or 0) / 60,
         route_points,
         "osrm",
         steps_from_osrm_legs(route.get("legs", [])),
+        vehicle_type,
+        promo_code,
     )
-    await cache_set_json(key, cached_route_payload(estimate))
-    return estimate
+
+
+
 
 
 @app.post("/routes/estimate")
 async def estimate_route(payload: RouteEstimateRequest):
-    return await calculate_route_estimate(payload["pickup"], payload["destination"])
+    vehicle_type = normalize_vehicle_type(payload.get("vehicle_type"))
+    promo_code = normalize_promo_code(payload.get("promo_code"))
+    return await calculate_route_estimate(
+        payload["pickup"],
+        payload["destination"],
+        vehicle_type,
+        promo_code,
+    )
 
 
-@app.post("/rides")
-async def request_ride(
-    payload: RideRequest,
-    current_user: dict = Depends(get_current_user),
-):
-    rider_id = require_role(current_user, "rider")
-    if payload["rider_id"] != rider_id:
-        raise HTTPException(status_code=403, detail="Cannot request for another rider")
-    ensure_account_active(riders.get(rider_id))
 
-    now = now_iso()
-    ride_id = str(uuid4())
-    estimate = await calculate_route_estimate(payload["pickup"], payload["destination"])
-    ride = {
-        "id": ride_id,
-        "rider_id": rider_id,
-        "pickup": payload["pickup"],
-        "destination": payload["destination"],
-        "distance_km": estimate["distance_km"],
-        "duration_min": estimate["duration_min"],
-        "currency": estimate["currency"],
-        "fare": estimate["fare"],
-        "fare_breakdown": estimate["fare_breakdown"],
-        "status": "matching",
-        "driver_id": None,
-        "driver_distance_km": None,
-        "driver_location": None,
-        "rider_location": None,
-        "payment": create_mock_payment(ride_id, estimate["fare"], now, estimate["fare_breakdown"]),
-        "declined_driver_ids": [],
-        "status_history": [
-            {
-                "from": None,
-                "status": "matching",
-                "actor": "rider",
-                "at": now,
-            }
-        ],
-        "created_at": now,
-        "updated_at": now,
-    }
 
     rides[ride_id] = ride
-    await assign_nearest_driver(ride)
+    record_fraud_event(
+        fraud_assessment,
+        "review_required" if fraud_assessment["review_required"] else "allowed",
+    )
+    record_audit_event(
+        action="ride.request.created",
+        actor=current_user,
+        target_type="ride",
+        target_id=ride_id,
+        metadata={
+            "status": initial_status,
+            "vehicle_type": vehicle_type,
+            "fare": estimate["fare"],
+            "risk_level": fraud_assessment["risk_level"],
+        },
+    )
+    if scheduled_for:
+        await notify_rider(
+            ride,
+            "Ride scheduled",
+            f"Your {vehicle_type_config(vehicle_type)['label']} ride is scheduled for {scheduled_for}.",
+            "ride_scheduled",
+        )
+    else:
+        await assign_waiting_rides()
     await persist_runtime_state()
     return public_ride(ride)
 
@@ -2410,12 +3123,14 @@ async def update_rider_location(
 
 
 @app.get("/rides/history")
-def get_ride_history(current_user: dict = Depends(get_current_user)):
+async def get_ride_history(current_user: dict = Depends(get_current_user)):
+    await assign_waiting_rides()
     return ride_history_for_user(current_user)
 
 
 @app.get("/rides/{ride_id}")
-def get_ride(ride_id: str, current_user: dict = Depends(get_current_user)):
+async def get_ride(ride_id: str, current_user: dict = Depends(get_current_user)):
+    await assign_waiting_rides()
     ride = rides.get(ride_id)
     if not ride:
         raise HTTPException(status_code=404, detail="Ride not found")
@@ -2424,6 +3139,8 @@ def get_ride(ride_id: str, current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Cannot view this ride")
 
     return public_ride(ride)
+
+
 
 
 @app.post("/rides/{ride_id}/share")
@@ -2449,6 +3166,13 @@ async def create_ride_share(ride_id: str, current_user: dict = Depends(get_curre
         trip_shares[share_token] = share
         ride["share_token"] = share_token
         ride["updated_at"] = now_iso()
+        record_audit_event(
+            action="ride.share.created",
+            actor=current_user,
+            target_type="ride",
+            target_id=ride_id,
+            metadata={"share_token": share_token},
+        )
         await persist_runtime_state()
 
     return {
@@ -2575,6 +3299,13 @@ async def report_ride_issue(
     issue_reports[report["id"]] = report
     ride.setdefault("issue_reports", []).append(report)
     ride["updated_at"] = reported_at
+    record_audit_event(
+        action="ride.issue_reported",
+        actor=current_user,
+        target_type="ride",
+        target_id=ride_id,
+        metadata={"issue_id": report["id"], "category": category},
+    )
 
     if current_user["role"] == "rider" and ride.get("driver_id"):
         await notify_driver(
@@ -2608,6 +3339,9 @@ async def accept_ride(ride_id: str, current_user: dict = Depends(get_current_use
     driver = drivers.get(driver_id)
     if not ride or not driver:
         raise HTTPException(status_code=404, detail="Ride not found")
+    if ride.get("driver_id") == driver_id and ride_dispatch_expired(ride):
+        await expire_dispatch_timeouts()
+        raise HTTPException(status_code=409, detail="Ride request expired")
     if ride.get("driver_id") != driver_id or ride.get("status") != "pending_driver":
         raise HTTPException(status_code=409, detail="Ride is not assigned to this driver")
 
@@ -2615,7 +3349,15 @@ async def accept_ride(ride_id: str, current_user: dict = Depends(get_current_use
     driver["availability"] = "busy"
     driver["current_ride_id"] = ride_id
     stats["accepted"] += 1
+    ride["dispatch_expires_at"] = None
     set_ride_status(ride, "accepted", "driver")
+    record_audit_event(
+        action="ride.driver.accepted",
+        actor=current_user,
+        target_type="ride",
+        target_id=ride_id,
+        metadata={"driver_id": driver_id},
+    )
     await notify_rider(
         ride,
         "Ride accepted",
@@ -2642,10 +3384,18 @@ async def reject_ride(ride_id: str, current_user: dict = Depends(get_current_use
     stats = driver.setdefault("stats", {"accepted": 0, "rejected": 0})
     if driver_id not in ride["declined_driver_ids"]:
         ride["declined_driver_ids"].append(driver_id)
-    driver["availability"] = "available"
+    driver["availability"] = "available" if driver_can_receive_requests(driver) else "offline"
     driver["current_ride_id"] = None
     stats["rejected"] += 1
+    ride["dispatch_expires_at"] = None
     set_ride_status(ride, "matching", "driver")
+    record_audit_event(
+        action="ride.driver.rejected",
+        actor=current_user,
+        target_type="ride",
+        target_id=ride_id,
+        metadata={"driver_id": driver_id},
+    )
 
     await broadcast_driver(driver_id, {"type": "ride_cleared", "ride_id": ride_id})
     await assign_nearest_driver(ride)
@@ -2672,13 +3422,21 @@ async def update_ride_status(
         raise HTTPException(status_code=400, detail="Unsupported driver status update")
 
     set_ride_status(ride, next_status, "driver")
+    record_audit_event(
+        action="ride.status.updated",
+        actor=current_user,
+        target_type="ride",
+        target_id=ride_id,
+        metadata={"status": next_status},
+    )
     if next_status == "completed":
         capture_mock_payment(ride)
+        await send_receipt_email_for_ride(ride, "trip_completed")
         release_driver_for_ride(ride)
         await notify_rider(
             ride,
             "Trip complete",
-            "Your trip is complete and the payment has been captured.",
+            "Your trip is complete and the receipt is ready.",
             "ride_completed",
         )
         await notify_driver(
@@ -2722,6 +3480,13 @@ async def simulate_ride_refund(ride_id: str, current_user: dict = Depends(get_cu
 
     refund_mock_payment(ride, "simulated_rider_refund")
     driver_id = ride.get("driver_id")
+    record_audit_event(
+        action="ride.payment.refunded",
+        actor=current_user,
+        target_type="ride",
+        target_id=ride_id,
+        metadata={"payment_id": (ride.get("payment") or {}).get("id")},
+    )
     await notify_rider(
         ride,
         "Refund simulated",
@@ -2759,8 +3524,24 @@ async def cancel_ride(ride_id: str, current_user: dict = Depends(get_current_use
         raise HTTPException(status_code=403, detail="Cannot cancel this ride")
 
     driver_id = ride.get("driver_id")
+    previous_status = ride.get("status")
+    cancellation_fee = cancellation_fee_for_ride(ride, actor, previous_status)
     set_ride_status(ride, "cancelled", actor)
-    void_mock_payment(ride, f"cancelled_by_{actor}")
+    ride["dispatch_expires_at"] = None
+    capture_cancellation_fee(ride, cancellation_fee, actor)
+    record_audit_event(
+        action="ride.cancelled",
+        actor=current_user,
+        target_type="ride",
+        target_id=ride_id,
+        metadata={
+            "previous_status": previous_status,
+            "cancelled_by": actor,
+            "cancellation_fee": cancellation_fee,
+        },
+    )
+    if cancellation_fee > 0:
+        await send_receipt_email_for_ride(ride, "cancellation_fee")
     release_driver_for_ride(ride)
 
     if actor == "driver":
@@ -2774,16 +3555,28 @@ async def cancel_ride(ride_id: str, current_user: dict = Depends(get_current_use
         await notify_driver(
             driver_id,
             "Ride cancelled",
-            "The rider cancelled this trip.",
+            (
+                "The rider cancelled this trip. A cancellation fee was charged."
+                if cancellation_fee > 0
+                else "The rider cancelled this trip."
+            ),
             "ride_cancelled",
             ride_id,
         )
+        if cancellation_fee > 0:
+            await notify_rider(
+                ride,
+                "Cancellation fee charged",
+                f"A {FARE_CURRENCY} {cancellation_fee:.2f} cancellation fee was charged to your wallet.",
+                "cancellation_fee_charged",
+            )
 
     await broadcast_ride(ride)
     if driver_id:
         await broadcast_driver(driver_id, {"type": "ride_update", "ride": public_ride(ride)})
         await broadcast_driver(driver_id, {"type": "ride_cleared", "ride_id": ride_id})
 
+    await assign_waiting_rides()
     await persist_runtime_state()
     return public_ride(ride)
 
