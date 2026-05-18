@@ -1420,6 +1420,20 @@ def ensure_account_active(user: dict | None) -> None:
         raise HTTPException(status_code=403, detail="Account is suspended")
 
 
+def default_driver_documents(submitted_at: str | None = None, *, status: str = "pending_review") -> dict:
+    timestamp = submitted_at or now_iso()
+    return {
+        document_type: {
+            **config,
+            "status": status,
+            "reference": f"{document_type}_{uuid4().hex[:10]}",
+            "submitted_at": timestamp,
+            "reviewed_at": timestamp if status == "verified" else None,
+            "reviewed_by": "system" if status == "verified" else None,
+        }
+        for document_type, config in DRIVER_DOCUMENT_TYPES.items()
+    }
+
 
 
 
