@@ -725,6 +725,14 @@ def vehicle_type_config(vehicle_type: str | None) -> dict:
     return VEHICLE_TYPES.get(vehicle_type or DEFAULT_VEHICLE_TYPE, VEHICLE_TYPES[DEFAULT_VEHICLE_TYPE])
 
 
+def normalize_vehicle_type(vehicle_type: str | None) -> str:
+    normalized = (vehicle_type or DEFAULT_VEHICLE_TYPE).strip().lower()
+    if normalized not in VEHICLE_TYPES:
+        allowed = ", ".join(sorted(VEHICLE_TYPES))
+        raise HTTPException(status_code=400, detail=f"Vehicle type must be one of: {allowed}")
+    return normalized
+
+
 
 
 def ensure_default_admin() -> None:
