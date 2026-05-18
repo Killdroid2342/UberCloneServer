@@ -733,6 +733,53 @@ def normalize_vehicle_type(vehicle_type: str | None) -> str:
     return normalized
 
 
+def public_vehicle_types() -> list[dict]:
+    return [
+        {
+            "type": key,
+            "label": config["label"],
+            "description": config["description"],
+            "capacity": config["capacity"],
+            "fare_multiplier": config["fare_multiplier"],
+        }
+        for key, config in VEHICLE_TYPES.items()
+    ]
+
+
+def parse_datetime(value: str | None, field_name: str) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be an ISO date-time")
+
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be an ISO date-time")
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def normalize_scheduled_for(value: str | None) -> str | None:
+    scheduled_at = parse_datetime(value, "scheduled_for")
+    if scheduled_at is None:
+        return None
+    if scheduled_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Scheduled time must be in the future")
+    return scheduled_at.isoformat()
+
+
+def ride_scheduled_datetime(ride: dict) -> datetime | None:
+    try:
+        return parse_datetime(ride.get("scheduled_for"), "scheduled_for")
+    except HTTPException:
+        return None
 
 
 def ensure_default_admin() -> None:
