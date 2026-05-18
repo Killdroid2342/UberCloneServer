@@ -1313,6 +1313,92 @@ def trim_audit_logs() -> None:
         audit_logs.pop(event.get("id"), None)
 
 
+def record_audit_event(
+    *,
+    action: str,
+    actor: dict | None = None,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    outcome: str = "success",
+    metadata: dict | None = None,
+    request: Request | None = None,
+) -> dict:
+    event_id = f"audit_{uuid4().hex[:12]}"
+    event = {
+        "id": event_id,
+        "action": action,
+        "outcome": outcome,
+        "actor": audit_actor_from(actor),
+        "target_type": target_type,
+        "target_id": target_id,
+        "metadata": safe_audit_metadata(metadata),
+        "request_id": request_id_for(request) if request else None,
+        "client_ip": client_ip_for(request) if request else None,
+        "user_agent": request.headers.get("User-Agent") if request else None,
+        "created_at": now_iso(),
+    }
+    audit_logs[event_id] = event
+    trim_audit_logs()
+    logger.info(
+        "audit_event action=%s outcome=%s actor_role=%s target_type=%s target_id=%s request_id=%s",
+        action,
+        outcome,
+        event["actor"].get("role"),
+        target_type,
+        target_id,
+        event.get("request_id"),
+    )
+    return event
+
+
+def public_audit_log(event: dict) -> dict:
+    return {
+        "id": event.get("id"),
+        "action": event.get("action"),
+        "outcome": event.get("outcome"),
+        "actor": event.get("actor") or {},
+        "target_type": event.get("target_type"),
+        "target_id": event.get("target_id"),
+        "metadata": event.get("metadata") or {},
+        "request_id": event.get("request_id"),
+        "client_ip": event.get("client_ip"),
+        "user_agent": event.get("user_agent"),
+        "created_at": event.get("created_at"),
+    }
+
+
+def build_audit_summary(limit: int = 12) -> dict:
+    events = sorted(audit_logs.values(), key=lambda event: event.get("created_at", ""), reverse=True)
+    action_counts: dict[str, int] = {}
+    outcome_counts: dict[str, int] = {}
+    for event in events:
+        action = event.get("action") or "unknown"
+        outcome = event.get("outcome") or "unknown"
+        action_counts[action] = action_counts.get(action, 0) + 1
+        outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+
+    return {
+        "total_events": len(events),
+        "action_counts": action_counts,
+        "outcome_counts": outcome_counts,
+        "recent_events": [public_audit_log(event) for event in events[:limit]],
+    }
+
+
+def build_access_control_summary(current_user: dict | None = None) -> dict:
+    user = user_for_auth(current_user.get("user_id"), current_user.get("role")) if current_user else None
+    permissions = permissions_for_user_record(user)
+    return {
+        "role": (user or {}).get("role"),
+        "admin_role": normalized_admin_role(user) if (user or {}).get("role") == "admin" else None,
+        "permissions": permissions,
+        "permission_details": [
+            ADMIN_PERMISSIONS[permission]
+            for permission in permissions
+            if permission in ADMIN_PERMISSIONS
+        ],
+        "roles": list(ADMIN_ROLE_DEFINITIONS.values()),
+    }
 
 
 def normalized_account_status(user: dict | None) -> str:
