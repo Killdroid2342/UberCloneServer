@@ -577,7 +577,71 @@ RIDE_STATUS_TIMESTAMPS = {
     "no_drivers_available": "no_drivers_available_at",
 }
 ACCOUNT_STATUSES = {"active", "suspended"}
-
+DRIVER_DOCUMENT_STATUSES = {"pending_review", "verified", "rejected"}
+DRIVER_DOCUMENT_TYPES = {
+    "license": {
+        "type": "license",
+        "label": "Driver license",
+        "required": True,
+    },
+    "insurance": {
+        "type": "insurance",
+        "label": "Insurance",
+        "required": True,
+    },
+    "vehicle_registration": {
+        "type": "vehicle_registration",
+        "label": "Vehicle registration",
+        "required": True,
+    },
+}
+VEHICLE_TYPES = {
+    "standard": {
+        "type": "standard",
+        "label": "Standard",
+        "description": "Everyday cars for up to 4 riders",
+        "capacity": 4,
+        "fare_multiplier": 1.0,
+    },
+    "xl": {
+        "type": "xl",
+        "label": "XL",
+        "description": "Larger vehicles for groups and luggage",
+        "capacity": 6,
+        "fare_multiplier": 1.35,
+    },
+    "premium": {
+        "type": "premium",
+        "label": "Premium",
+        "description": "Higher-rated premium vehicles",
+        "capacity": 4,
+        "fare_multiplier": 1.65,
+    },
+}
+DEFAULT_VEHICLE_TYPE = "standard"
+PROMO_CODES = {
+    "SAVE10": {
+        "code": "SAVE10",
+        "label": "10% off",
+        "type": "percent",
+        "value": 0.10,
+        "max_discount": 8.00,
+    },
+    "MYUBER5": {
+        "code": "MYUBER5",
+        "label": "$5 off",
+        "type": "fixed",
+        "value": 5.00,
+        "max_discount": 5.00,
+    },
+    "WELCOME20": {
+        "code": "WELCOME20",
+        "label": "20% off",
+        "type": "percent",
+        "value": 0.20,
+        "max_discount": 12.00,
+    },
+}
 
 Location = TypedDict("Location", {"lat": float, "lng": float})
 
