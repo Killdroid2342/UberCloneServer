@@ -295,6 +295,88 @@ def rate_limit_rule_for(method: str, path: str) -> tuple[str, int, int] | None:
     return "write", RATE_LIMIT_DEFAULT_PER_MINUTE, 60
 
 
+def rate_limit_headers(
+    limit: int,
+    remaining: int,
+    reset_epoch: int,
+    *,
+    include_retry_after: bool = False,
+) -> dict[str, str]:
+    retry_after = max(0, reset_epoch - int(time.time()))
+    headers = {
+        "X-RateLimit-Limit": str(limit),
+        "X-RateLimit-Remaining": str(max(0, remaining)),
+        "X-RateLimit-Reset": str(reset_epoch),
+    }
+    if include_retry_after:
+        headers["Retry-After"] = str(retry_after)
+    return headers
+
+
+def cleanup_rate_limit_buckets(now_epoch: int) -> None:
+    if len(rate_limit_buckets) < 10000:
+        return
+    stale_keys = [
+        key
+        for key, bucket in rate_limit_buckets.items()
+        if int(bucket.get("reset_epoch", 0)) <= now_epoch
+    ]
+    for key in stale_keys:
+        rate_limit_buckets.pop(key, None)
+
+
+async def check_rate_limit(request: Request) -> dict | None:
+    if not RATE_LIMIT_ENABLED:
+        return None
+
+    rule = rate_limit_rule_for(request.method.upper(), request.url.path)
+    if not rule:
+        return None
+
+    name, limit, window_seconds = rule
+    if limit <= 0:
+        return None
+
+    now_epoch = int(time.time())
+    window_start = (now_epoch // window_seconds) * window_seconds
+    reset_epoch = window_start + window_seconds
+    client_ip = client_ip_for(request)
+    bucket_key = f"{name}:{client_ip}"
+
+    if redis_client:
+        redis_key = f"{REDIS_CACHE_PREFIX}:rate:{window_start}:{bucket_key}"
+        try:
+            count = await redis_client.incr(redis_key)
+            if count == 1:
+                await redis_client.expire(redis_key, max(1, reset_epoch - now_epoch + 1))
+            remaining = limit - int(count)
+            return {
+                "allowed": count <= limit,
+                "limit": limit,
+                "remaining": remaining,
+                "reset_epoch": reset_epoch,
+                "name": name,
+            }
+        except Exception:
+            logger.exception("Redis rate limit check failed; using in-memory limiter")
+
+    cleanup_rate_limit_buckets(now_epoch)
+    memory_key = f"{window_start}:{bucket_key}"
+    bucket = rate_limit_buckets.get(memory_key)
+    if not bucket:
+        bucket = {"count": 0, "reset_epoch": reset_epoch}
+        rate_limit_buckets[memory_key] = bucket
+    bucket["count"] += 1
+    remaining = limit - int(bucket["count"])
+    return {
+        "allowed": bucket["count"] <= limit,
+        "limit": limit,
+        "remaining": remaining,
+        "reset_epoch": reset_epoch,
+        "name": name,
+    }
+
+
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
