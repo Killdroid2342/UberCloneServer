@@ -1153,6 +1153,71 @@ def percentile(values: list[float], percentile_value: float) -> float:
     return round(float(ordered[index]), 2)
 
 
+def record_http_observation(
+    *,
+    method: str,
+    path: str,
+    status_code: int,
+    duration_ms: float,
+    request_id: str,
+    rate_limited: bool = False,
+) -> None:
+    route_path = normalize_observability_path(path)
+    status_group = f"{status_code // 100}xx"
+    observability_metrics["total_requests"] = int(observability_metrics.get("total_requests", 0)) + 1
+
+    status_counts = observability_metrics.setdefault("status_counts", {})
+    status_counts[str(status_code)] = status_counts.get(str(status_code), 0) + 1
+
+    method_counts = observability_metrics.setdefault("method_counts", {})
+    method_counts[method] = method_counts.get(method, 0) + 1
+
+    latency_samples = observability_metrics.setdefault("latency_samples_ms", [])
+    bounded_append(latency_samples, round(duration_ms, 2), OBSERVABILITY_LATENCY_SAMPLES)
+
+    route_metrics = observability_metrics.setdefault("route_metrics", {})
+    route_key = f"{method} {route_path}"
+    route = route_metrics.setdefault(
+        route_key,
+        {
+            "method": method,
+            "path": route_path,
+            "count": 0,
+            "total_latency_ms": 0.0,
+            "max_latency_ms": 0.0,
+            "status_counts": {},
+            "latency_samples_ms": [],
+            "last_seen_at": None,
+        },
+    )
+    route["count"] += 1
+    route["total_latency_ms"] = round(float(route["total_latency_ms"]) + duration_ms, 2)
+    route["max_latency_ms"] = round(max(float(route["max_latency_ms"]), duration_ms), 2)
+    route["last_seen_at"] = now_iso()
+    route["status_counts"][status_group] = route["status_counts"].get(status_group, 0) + 1
+    bounded_append(route["latency_samples_ms"], round(duration_ms, 2), 50)
+
+    if status_code >= 500:
+        observability_metrics["error_requests"] = int(observability_metrics.get("error_requests", 0)) + 1
+    if rate_limited:
+        observability_metrics["rate_limited_requests"] = int(observability_metrics.get("rate_limited_requests", 0)) + 1
+
+    recent_requests = observability_metrics.setdefault("recent_requests", [])
+    bounded_append(
+        recent_requests,
+        {
+            "method": method,
+            "path": route_path,
+            "status_code": status_code,
+            "duration_ms": round(duration_ms, 2),
+            "request_id": request_id,
+            "rate_limited": rate_limited,
+            "at": now_iso(),
+        },
+        OBSERVABILITY_RECENT_REQUESTS,
+    )
+
+
 
 
 def normalized_account_status(user: dict | None) -> str:
