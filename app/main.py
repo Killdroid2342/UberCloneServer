@@ -377,6 +377,120 @@ async def check_rate_limit(request: Request) -> dict | None:
     }
 
 
+@app.middleware("http")
+async def log_http_requests(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid4().hex
+    request.state.request_id = request_id
+    start = time.perf_counter()
+
+    rate_limit = await check_rate_limit(request)
+    if rate_limit and not rate_limit["allowed"]:
+        duration_ms = (time.perf_counter() - start) * 1000
+        record_http_observation(
+            method=request.method,
+            path=request.url.path,
+            status_code=429,
+            duration_ms=duration_ms,
+            request_id=request_id,
+            rate_limited=True,
+        )
+        logger.warning(
+            "rate_limited method=%s path=%s bucket=%s client_ip=%s duration_ms=%.2f request_id=%s",
+            request.method,
+            request.url.path,
+            rate_limit.get("name"),
+            client_ip_for(request),
+            duration_ms,
+            request_id,
+        )
+        return error_response(
+            request,
+            429,
+            "Too many requests. Please wait before trying again.",
+            rate_limit_headers(
+                rate_limit["limit"],
+                rate_limit["remaining"],
+                rate_limit["reset_epoch"],
+                include_retry_after=True,
+            ),
+        )
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (time.perf_counter() - start) * 1000
+        record_http_observation(
+            method=request.method,
+            path=request.url.path,
+            status_code=500,
+            duration_ms=duration_ms,
+            request_id=request_id,
+        )
+        logger.exception(
+            "unhandled_request_error method=%s path=%s duration_ms=%.2f request_id=%s",
+            request.method,
+            request.url.path,
+            duration_ms,
+            request_id,
+        )
+        return error_response(request, 500, "Internal server error")
+
+    duration_ms = (time.perf_counter() - start) * 1000
+    response.headers["X-Request-ID"] = request_id
+    record_http_observation(
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        duration_ms=duration_ms,
+        request_id=request_id,
+    )
+    if rate_limit:
+        response.headers.update(
+            rate_limit_headers(
+                rate_limit["limit"],
+                rate_limit["remaining"],
+                rate_limit["reset_epoch"],
+            )
+        )
+    logger.info(
+        "http_request method=%s path=%s status_code=%s duration_ms=%.2f request_id=%s",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+        request_id,
+    )
+    return response
+
+
+@app.exception_handler(StarletteHTTPException)
+async def handle_http_exception(request: Request, exc: StarletteHTTPException):
+    level = logging.ERROR if exc.status_code >= 500 else logging.WARNING
+    logger.log(
+        level,
+        "http_error method=%s path=%s status_code=%s detail=%s request_id=%s",
+        request.method,
+        request.url.path,
+        exc.status_code,
+        exc.detail,
+        request_id_for(request),
+    )
+    response = error_response(request, exc.status_code, exc.detail)
+    if exc.headers:
+        response.headers.update(exc.headers)
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_validation_exception(request: Request, exc: RequestValidationError):
+    logger.warning(
+        "validation_error method=%s path=%s errors=%s request_id=%s",
+        request.method,
+        request.url.path,
+        exc.errors(),
+        request_id_for(request),
+    )
+    return error_response(request, 422, exc.errors())
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
