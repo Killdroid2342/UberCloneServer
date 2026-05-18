@@ -1218,6 +1218,101 @@ def record_http_observation(
     )
 
 
+def public_route_metric(metric: dict) -> dict:
+    count = max(int(metric.get("count", 0)), 1)
+    latency_samples = [float(value) for value in metric.get("latency_samples_ms", [])]
+    return {
+        "method": metric.get("method"),
+        "path": metric.get("path"),
+        "count": metric.get("count", 0),
+        "average_latency_ms": round(float(metric.get("total_latency_ms", 0)) / count, 2),
+        "p95_latency_ms": percentile(latency_samples, 95),
+        "max_latency_ms": metric.get("max_latency_ms", 0),
+        "status_counts": metric.get("status_counts", {}),
+        "last_seen_at": metric.get("last_seen_at"),
+    }
+
+
+def build_observability_dashboard() -> dict:
+    latency_samples = [float(value) for value in observability_metrics.get("latency_samples_ms", [])]
+    total_requests = int(observability_metrics.get("total_requests", 0))
+    error_requests = int(observability_metrics.get("error_requests", 0))
+    uptime_seconds = max(1, int(time.time() - APP_STARTED_AT))
+    route_metrics = [
+        public_route_metric(metric)
+        for metric in observability_metrics.get("route_metrics", {}).values()
+    ]
+
+    return {
+        "generated_at": now_iso(),
+        "instance_id": INSTANCE_ID,
+        "uptime_seconds": uptime_seconds,
+        "http": {
+            "total_requests": total_requests,
+            "requests_per_minute": round((total_requests / uptime_seconds) * 60, 2),
+            "error_requests": error_requests,
+            "error_rate": percentage(error_requests, total_requests),
+            "rate_limited_requests": int(observability_metrics.get("rate_limited_requests", 0)),
+            "average_latency_ms": round(sum(latency_samples) / len(latency_samples), 2) if latency_samples else 0,
+            "p95_latency_ms": percentile(latency_samples, 95),
+            "status_counts": observability_metrics.get("status_counts", {}),
+            "method_counts": observability_metrics.get("method_counts", {}),
+            "routes": sorted(route_metrics, key=lambda metric: metric.get("count", 0), reverse=True)[:12],
+            "slowest_routes": sorted(route_metrics, key=lambda metric: metric.get("p95_latency_ms", 0), reverse=True)[:6],
+            "recent_requests": list(reversed(observability_metrics.get("recent_requests", [])[-20:])),
+        },
+        "realtime": {
+            "ride_sockets": sum(len(connections) for connections in ride_connections.values()),
+            "driver_sockets": sum(len(connections) for connections in driver_connections.values()),
+            "share_sockets": sum(len(connections) for connections in share_connections.values()),
+            "total_sockets": (
+                sum(len(connections) for connections in ride_connections.values())
+                + sum(len(connections) for connections in driver_connections.values())
+                + sum(len(connections) for connections in share_connections.values())
+            ),
+        },
+        "background": {
+            "scheduled_rides_task_running": bool(scheduled_rides_task and not scheduled_rides_task.done()),
+            "redis_subscriber_running": bool(redis_subscriber_task and not redis_subscriber_task.done()),
+        },
+        "storage": storage_status(),
+    }
+
+
+def audit_actor_from(actor: dict | None) -> dict:
+    if not actor:
+        return {"user_id": None, "role": None, "email": None, "name": None}
+    user_id = actor.get("user_id") or actor.get("id")
+    role = actor.get("role")
+    user = user_for_auth(user_id, role) if user_id and role else actor
+    return {
+        "user_id": user_id,
+        "role": role,
+        "email": (user or {}).get("email"),
+        "name": (user or {}).get("name"),
+    }
+
+
+def safe_audit_metadata(metadata: dict | None) -> dict:
+    if not isinstance(metadata, dict):
+        return {}
+    blocked_keys = {"password", "password_hash", "token", "access_token", "refresh_token"}
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key not in blocked_keys
+    }
+
+
+def trim_audit_logs() -> None:
+    limit = max(AUDIT_LOG_MAX_EVENTS, 1)
+    if len(audit_logs) <= limit:
+        return
+    oldest = sorted(audit_logs.values(), key=lambda event: event.get("created_at", ""))
+    for event in oldest[: len(audit_logs) - limit]:
+        audit_logs.pop(event.get("id"), None)
+
+
 
 
 def normalized_account_status(user: dict | None) -> str:
