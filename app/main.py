@@ -1663,6 +1663,81 @@ def user_for_auth(user_id: str, role: str) -> dict | None:
     return store.get(user_id) if store else None
 
 
+def normalized_admin_role(admin: dict | None) -> str:
+    role = (admin or {}).get("admin_role") or "super_admin"
+    if role not in ADMIN_ROLE_DEFINITIONS:
+        role = "super_admin"
+    if admin is not None:
+        admin["admin_role"] = role
+    return role
+
+
+def admin_permissions_for(admin: dict | None) -> list[str]:
+    if not admin:
+        return []
+
+    raw_permissions = admin.get("permissions")
+    if isinstance(raw_permissions, list):
+        permissions = sorted(
+            {
+                permission
+                for permission in raw_permissions
+                if isinstance(permission, str) and permission in ADMIN_PERMISSIONS
+            }
+        )
+        if permissions:
+            admin["permissions"] = permissions
+            return permissions
+
+    role = normalized_admin_role(admin)
+    permissions = list(ADMIN_ROLE_DEFINITIONS[role]["permissions"])
+    admin["permissions"] = permissions
+    return permissions
+
+
+def permissions_for_user_record(user: dict | None) -> list[str]:
+    if not user:
+        return []
+    role = user.get("role")
+    if role == "admin":
+        return admin_permissions_for(user)
+    return list(ROLE_PERMISSIONS.get(role, []))
+
+
+def role_permission_summary() -> dict:
+    return {
+        "roles": {
+            role: list(permissions)
+            for role, permissions in ROLE_PERMISSIONS.items()
+        },
+        "admin_roles": list(ADMIN_ROLE_DEFINITIONS.values()),
+        "admin_permissions": list(ADMIN_PERMISSIONS.values()),
+    }
+
+
+def permissions_for_current_user(current_user: dict) -> list[str]:
+    role = current_user.get("role")
+    user = user_for_auth(current_user.get("user_id"), role)
+    return permissions_for_user_record(user) or list(ROLE_PERMISSIONS.get(role, []))
+
+
+def require_permission(current_user: dict, permission: str) -> str:
+    role = current_user.get("role")
+    user_id = current_user.get("user_id")
+    user = user_for_auth(user_id, role)
+    ensure_account_active(user)
+    if permission not in permissions_for_user_record(user):
+        record_audit_event(
+            action="access.denied",
+            actor=current_user,
+            target_type="permission",
+            target_id=permission,
+            outcome="denied",
+        )
+        raise HTTPException(status_code=403, detail="Permission denied")
+    return user_id
+
+
 
 def decode_auth_token(token: str | None) -> dict:
     if token is None:
