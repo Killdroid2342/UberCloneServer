@@ -4846,6 +4846,39 @@ def get_me(current_user: dict = Depends(get_current_user)):
     return safe_user(user)
 
 
+@app.get("/wallet")
+def get_wallet(current_user: dict = Depends(get_current_user)):
+    rider_id = require_role(current_user, "rider")
+    rider = riders.get(rider_id)
+    ensure_account_active(rider)
+    return public_wallet(rider)
+
+
+@app.post("/wallet/top-up")
+async def top_up_wallet(
+    payload: WalletTopUpRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    rider_id = require_role(current_user, "rider")
+    rider = riders.get(rider_id)
+    ensure_account_active(rider)
+    amount = normalize_wallet_top_up_amount(payload.get("amount"))
+    wallet_transaction(
+        rider_id,
+        transaction_type="top_up",
+        amount=amount,
+        description="Wallet top-up",
+    )
+    record_audit_event(
+        action="wallet.top_up",
+        actor=current_user,
+        target_type="rider",
+        target_id=rider_id,
+        metadata={"amount": amount},
+    )
+    await persist_runtime_state()
+    return public_wallet(rider)
+
 
 @app.get("/notifications")
 def get_notifications(current_user: dict = Depends(get_current_user)):
