@@ -4371,6 +4371,50 @@ async def expire_dispatch_timeouts() -> list[dict]:
     return expired_rides
 
 
+async def assign_waiting_rides() -> None:
+    await activate_due_scheduled_rides()
+    await expire_dispatch_timeouts()
+    refresh_ride_queue()
+    for ride in waiting_ride_queue():
+        previous_status = ride["status"]
+        previous_driver_id = ride.get("driver_id")
+        await assign_nearest_driver(ride)
+        if ride["status"] != previous_status or ride.get("driver_id") != previous_driver_id:
+            await broadcast_ride(ride)
+    refresh_ride_queue()
+
+
+async def activate_due_scheduled_rides() -> list[dict]:
+    activated = []
+    for ride in due_scheduled_rides():
+        if ride.get("status") != "scheduled":
+            continue
+        set_ride_status(ride, "matching", "system")
+        ride["queued_at"] = now_iso()
+        activated.append(ride)
+        await notify_rider(
+            ride,
+            "Scheduled ride is ready",
+            "We are matching your scheduled ride with an available driver.",
+            "scheduled_ride_ready",
+        )
+        await broadcast_ride(ride)
+
+    if activated:
+        refresh_ride_queue()
+        await persist_runtime_state()
+    return activated
+
+
+async def scheduled_ride_loop() -> None:
+    while True:
+        try:
+            await assign_waiting_rides()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Scheduled ride queue processing failed")
+        await asyncio.sleep(SCHEDULED_RIDE_CHECK_INTERVAL_SECONDS)
 
 
 async def update_driver_location_state(driver_id: str, location: dict) -> dict | None:
