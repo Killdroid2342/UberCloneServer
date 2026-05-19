@@ -2447,6 +2447,62 @@ def void_mock_payment(ride: dict, reason: str) -> None:
     ride["updated_at"] = voided_at
 
 
+def cancellation_fee_for_ride(ride: dict, actor: str, previous_status: str | None) -> float:
+    if actor != "rider" or previous_status not in {"accepted", "arrived"}:
+        return 0.0
+
+    payment = ride.get("payment") or {}
+    original_amount = money(payment.get("original_amount") or payment.get("authorized_amount") or ride.get("fare"))
+    if original_amount <= 0:
+        return 0.0
+
+    fee = money(original_amount * CANCELLATION_FEE_RATE)
+    fee = max(fee, CANCELLATION_FEE_MIN)
+    fee = min(fee, CANCELLATION_FEE_MAX, original_amount)
+    return money(fee)
+
+
+def capture_cancellation_fee(ride: dict, amount: float, actor: str) -> None:
+    fee_amount = money(amount)
+    if fee_amount <= 0:
+        void_mock_payment(ride, f"cancelled_by_{actor}")
+        return
+
+    payment = ride.get("payment")
+    if not payment or payment.get("status") != "authorized":
+        return
+
+    captured_at = now_iso()
+    original_amount = money(payment.get("original_amount") or payment.get("amount"))
+    released_amount = money(max(original_amount - fee_amount, 0))
+    transaction = wallet_transaction(
+        ride["rider_id"],
+        transaction_type="cancellation_fee",
+        amount=-fee_amount,
+        description="Ride cancellation fee",
+        ride_id=ride["id"],
+        payment_id=payment["id"],
+    )
+    cancellation_fee = {
+        "amount": fee_amount,
+        "currency": payment.get("currency", FARE_CURRENCY),
+        "charged_to": "rider",
+        "charged_at": captured_at,
+        "reason": "Rider cancelled after driver accepted",
+    }
+
+    payment["status"] = "paid"
+    payment["amount"] = fee_amount
+    payment["released_amount"] = released_amount
+    payment["captured_at"] = captured_at
+    payment["voided_at"] = None
+    payment["receipt_number"] = payment.get("receipt_number") or generate_receipt_number()
+    payment["wallet_transaction_id"] = transaction["id"]
+    payment["cancellation_fee"] = cancellation_fee
+    ride["payment"] = payment
+    ride["cancellation_fee"] = cancellation_fee
+    ride["updated_at"] = captured_at
+    ensure_receipt_for_ride(ride)
 
 
 def refund_mock_payment(ride: dict, reason: str) -> bool:
