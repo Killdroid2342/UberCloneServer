@@ -2347,6 +2347,67 @@ def receipt_email_body(receipt: dict) -> str:
     return "\n".join(lines)
 
 
+def send_receipt_email_smtp(recipient_email: str, receipt: dict) -> None:
+    if not SMTP_HOST:
+        return
+
+    message = EmailMessage()
+    message["From"] = RECEIPT_EMAIL_FROM
+    message["To"] = recipient_email
+    message["Subject"] = receipt_email_subject(receipt)
+    message.set_content(receipt_email_body(receipt))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
+        if SMTP_USE_TLS:
+            server.starttls()
+        if SMTP_USERNAME:
+            server.login(SMTP_USERNAME, SMTP_PASSWORD or "")
+        server.send_message(message)
+
+
+async def send_receipt_email_for_ride(ride: dict, reason: str) -> dict | None:
+    receipt = ensure_receipt_for_ride(ride)
+    if not receipt:
+        return None
+
+    rider = riders.get(ride.get("rider_id"))
+    recipient_email = (rider or {}).get("email")
+    attempted_at = now_iso()
+    delivery = {
+        "id": f"email_{uuid4().hex[:12]}",
+        "channel": "email",
+        "reason": reason,
+        "status": "skipped",
+        "provider": "smtp" if SMTP_HOST else "local_log",
+        "attempted_at": attempted_at,
+        "sent_at": None,
+        "error": None,
+    }
+
+    if not recipient_email:
+        delivery["error"] = "Rider email is unavailable"
+    elif SMTP_HOST:
+        try:
+            await asyncio.to_thread(send_receipt_email_smtp, recipient_email, receipt)
+            delivery["status"] = "sent"
+            delivery["sent_at"] = now_iso()
+        except Exception as exc:
+            delivery["status"] = "failed"
+            delivery["error"] = str(exc)
+            logger.exception("receipt_email_failed ride_id=%s receipt_number=%s", ride["id"], receipt["receipt_number"])
+    else:
+        delivery["status"] = "logged"
+        delivery["sent_at"] = attempted_at
+        logger.info(
+            "receipt_email_logged to=%s receipt_number=%s ride_id=%s",
+            recipient_email,
+            receipt["receipt_number"],
+            ride["id"],
+        )
+
+    receipt["email_delivery"] = delivery
+    ride["payment"]["receipt"] = receipt
+    return delivery
 
 
 def capture_mock_payment(ride: dict) -> None:
