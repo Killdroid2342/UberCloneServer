@@ -3307,7 +3307,69 @@ def public_push_subscription(subscription: dict) -> dict:
     }
 
 
+def push_payload_for_notification(notification: dict) -> dict:
+    ride_id = notification.get("ride_id")
+    return {
+        "title": notification["title"],
+        "body": notification["body"],
+        "kind": notification["kind"],
+        "notification_id": notification["id"],
+        "ride_id": ride_id,
+        "url": "/" if not ride_id else f"/?ride={ride_id}",
+    }
 
+
+def send_web_push(subscription: dict, payload: dict) -> None:
+    if not webpush or not PUSH_VAPID_PRIVATE_KEY:
+        return
+
+    webpush(
+        subscription_info={
+            "endpoint": subscription["endpoint"],
+            "keys": subscription["keys"],
+        },
+        data=json.dumps(payload),
+        vapid_private_key=PUSH_VAPID_PRIVATE_KEY,
+        vapid_claims={"sub": PUSH_VAPID_SUBJECT},
+    )
+
+
+async def dispatch_push_notification(notification: dict) -> None:
+    if not PUSH_VAPID_PUBLIC_KEY or not PUSH_VAPID_PRIVATE_KEY or not webpush:
+        return
+
+    matching_subscriptions = [
+        subscription
+        for subscription in push_subscriptions.values()
+        if subscription.get("user_id") == notification.get("user_id")
+        and subscription.get("role") == notification.get("role")
+    ]
+    if not matching_subscriptions:
+        return
+
+    payload = push_payload_for_notification(notification)
+    stale_subscription_ids: list[str] = []
+
+    for subscription in matching_subscriptions:
+        try:
+            await asyncio.to_thread(send_web_push, subscription, payload)
+            subscription["last_delivery_at"] = now_iso()
+            subscription["last_error"] = None
+        except Exception as exc:
+            subscription["last_error"] = str(exc)
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            if status_code in {404, 410}:
+                stale_subscription_ids.append(subscription["id"])
+            logger.warning(
+                "push_notification_failed user_id=%s role=%s notification_id=%s error=%s",
+                notification.get("user_id"),
+                notification.get("role"),
+                notification.get("id"),
+                exc,
+            )
+
+    for subscription_id in stale_subscription_ids:
+        push_subscriptions.pop(subscription_id, None)
 
 
 async def notify_rider(ride: dict, title: str, body: str, kind: str) -> None:
