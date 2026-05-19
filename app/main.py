@@ -1483,7 +1483,60 @@ def ensure_driver_document_state(driver: dict | None) -> dict:
     return refresh_driver_document_summary(driver)
 
 
+def refresh_driver_document_summary(driver: dict) -> dict:
+    document_verification = driver.setdefault("document_verification", {"documents": {}})
+    documents = document_verification.setdefault("documents", {})
+    required_documents = [
+        document
+        for document_type, document in documents.items()
+        if DRIVER_DOCUMENT_TYPES.get(document_type, {}).get("required", True)
+    ]
+    verified_count = sum(1 for document in required_documents if document.get("status") == "verified")
+    rejected_count = sum(1 for document in required_documents if document.get("status") == "rejected")
+    pending_count = sum(1 for document in required_documents if document.get("status") == "pending_review")
 
+    if rejected_count:
+        status = "rejected"
+        onboarding_status = "needs_attention"
+    elif verified_count == len(required_documents) and required_documents:
+        status = "verified"
+        onboarding_status = "complete"
+    else:
+        status = "pending_review"
+        onboarding_status = "pending_review"
+
+    document_verification.update(
+        {
+            "status": status,
+            "required": len(required_documents),
+            "verified": verified_count,
+            "pending": pending_count,
+            "rejected": rejected_count,
+        }
+    )
+    driver["onboarding_status"] = onboarding_status
+    return document_verification
+
+
+def driver_documents_verified(driver: dict | None) -> bool:
+    if not driver:
+        return False
+    summary = ensure_driver_document_state(driver)
+    return summary.get("status") == "verified"
+
+
+def driver_can_receive_requests(driver: dict | None) -> bool:
+    if not driver:
+        return False
+    return is_account_active(driver) and driver_documents_verified(driver)
+
+
+def normalize_document_review_status(status: str | None) -> str:
+    normalized = (status or "").strip().lower()
+    if normalized not in DRIVER_DOCUMENT_STATUSES:
+        allowed = ", ".join(sorted(DRIVER_DOCUMENT_STATUSES))
+        raise HTTPException(status_code=400, detail=f"Document status must be one of: {allowed}")
+    return normalized
 
 
 def format_status(status: str | None) -> str:
