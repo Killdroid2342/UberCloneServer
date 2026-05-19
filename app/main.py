@@ -4319,6 +4319,58 @@ async def assign_nearest_driver(ride: dict) -> dict | None:
     return driver
 
 
+async def expire_dispatch_timeouts() -> list[dict]:
+    expired_rides: list[dict] = []
+    for ride in list(rides.values()):
+        if not ride_dispatch_expired(ride):
+            continue
+
+        driver_id = ride.get("driver_id")
+        driver = drivers.get(driver_id) if driver_id else None
+        if driver:
+            stats = driver.setdefault("stats", {"accepted": 0, "rejected": 0})
+            stats["rejected"] = stats.get("rejected", 0) + 1
+            stats["timed_out"] = stats.get("timed_out", 0) + 1
+            if driver.get("current_ride_id") == ride.get("id"):
+                driver["current_ride_id"] = None
+            if driver.get("availability") != "offline":
+                driver["availability"] = "available" if driver_can_receive_requests(driver) else "offline"
+
+        if driver_id and driver_id not in ride.setdefault("declined_driver_ids", []):
+            ride["declined_driver_ids"].append(driver_id)
+
+        ride["driver_id"] = None
+        ride["driver_distance_km"] = None
+        ride["driver_location"] = None
+        ride["dispatch_expires_at"] = None
+        set_ride_status(ride, "matching", "system")
+        expired_rides.append(ride)
+
+        if driver_id:
+            await broadcast_driver(driver_id, {"type": "ride_cleared", "ride_id": ride["id"]})
+            await notify_driver(
+                driver_id,
+                "Request expired",
+                "The ride request timed out and was sent back to dispatch.",
+                "ride_request_expired",
+                ride["id"],
+            )
+
+        await notify_rider(
+            ride,
+            "Finding another driver",
+            "The previous driver did not respond in time. We are matching another nearby driver.",
+            "dispatch_timeout",
+        )
+        await assign_nearest_driver(ride)
+        await broadcast_ride(ride)
+
+    if expired_rides:
+        refresh_ride_queue()
+        await persist_runtime_state()
+    return expired_rides
+
+
 
 
 async def update_driver_location_state(driver_id: str, location: dict) -> dict | None:
