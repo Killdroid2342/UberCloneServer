@@ -1937,6 +1937,50 @@ def surge_pricing_state(vehicle_type: str | None = None) -> dict:
     }
 
 
+def money(value: float | int | str | None) -> float:
+    try:
+        return round(float(value or 0), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def normalize_promo_code(value: str | None) -> str | None:
+    code = (value or "").strip().upper()
+    if not code:
+        return None
+    if code not in PROMO_CODES:
+        allowed = ", ".join(sorted(PROMO_CODES))
+        raise HTTPException(status_code=400, detail=f"Promo code must be one of: {allowed}")
+    return code
+
+
+def promo_discount_for(total: float, promo_code: str | None) -> float:
+    code = normalize_promo_code(promo_code)
+    if not code:
+        return 0.0
+
+    promo = PROMO_CODES[code]
+    if promo["type"] == "percent":
+        discount = money(total * float(promo["value"]))
+    else:
+        discount = money(promo["value"])
+
+    discount = min(discount, money(promo["max_discount"]), money(total))
+    return money(max(discount, 0))
+
+
+def apply_promo_to_breakdown(breakdown: dict, promo_code: str | None = None) -> dict:
+    code = normalize_promo_code(promo_code)
+    total_before_promo = money(breakdown["total"])
+    discount = promo_discount_for(total_before_promo, code)
+    discounted_total = money(max(total_before_promo - discount, 0))
+
+    breakdown["total_before_promo"] = total_before_promo
+    breakdown["promo_code"] = code
+    breakdown["promo_label"] = PROMO_CODES[code]["label"] if code else None
+    breakdown["promo_discount"] = discount
+    breakdown["total"] = discounted_total
+    return breakdown
 
 
 def fare_breakdown_for(
@@ -1988,6 +2032,8 @@ def fare_breakdown_for(
         },
         promo_code,
     )
+
+
 
 
 
