@@ -3939,6 +3939,41 @@ def active_ride_for_driver(driver_id: str) -> dict | None:
     return ride
 
 
+def driver_vehicle_type(driver: dict | None) -> str:
+    vehicle = (driver or {}).get("vehicle") or {}
+    configured_type = vehicle.get("type") or (driver or {}).get("vehicle_type")
+    if configured_type in VEHICLE_TYPES:
+        return configured_type
+    return DEFAULT_VEHICLE_TYPE
+
+
+def ride_vehicle_type(ride: dict | None) -> str:
+    configured_type = (ride or {}).get("vehicle_type")
+    if configured_type in VEHICLE_TYPES:
+        return configured_type
+    return DEFAULT_VEHICLE_TYPE
+
+
+def driver_matches_ride_vehicle(driver: dict, ride: dict) -> bool:
+    return driver_vehicle_type(driver) == ride_vehicle_type(ride)
+
+
+def waiting_ride_queue() -> list[dict]:
+    waiting = [
+        ride
+        for ride in rides.values()
+        if ride.get("status") in RIDE_QUEUE_STATUSES
+        and not ride.get("driver_id")
+    ]
+    return sorted(
+        waiting,
+        key=lambda ride: (
+            ride.get("queued_at") or ride.get("created_at") or "",
+            ride.get("id") or "",
+        ),
+    )
+
+
 
 
 async def postgis_driver_candidates(ride: dict, pickup: Location) -> list[tuple[float, dict]] | None:
