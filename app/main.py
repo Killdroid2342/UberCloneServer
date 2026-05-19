@@ -2068,6 +2068,37 @@ def default_rider_wallet(created_at: str | None = None) -> dict:
     }
 
 
+def ensure_rider_wallet(rider: dict | None) -> dict:
+    if not rider:
+        raise HTTPException(status_code=404, detail="Rider not found")
+
+    wallet = rider.get("wallet")
+    if not isinstance(wallet, dict):
+        wallet = default_rider_wallet(rider.get("created_at"))
+        rider["wallet"] = wallet
+
+    wallet["currency"] = wallet.get("currency") or FARE_CURRENCY
+    wallet["balance"] = money(wallet.get("balance"))
+    if not isinstance(wallet.get("transactions"), list):
+        wallet["transactions"] = []
+    return wallet
+
+
+def active_wallet_holds_for_rider(rider_id: str, exclude_payment_id: str | None = None) -> float:
+    hold_total = 0.0
+    for ride in rides.values():
+        if ride.get("rider_id") != rider_id:
+            continue
+        if ride.get("status") in TERMINAL_RIDE_STATUSES:
+            continue
+        payment = ride.get("payment") or {}
+        if payment.get("status") != "authorized":
+            continue
+        if exclude_payment_id and payment.get("id") == exclude_payment_id:
+            continue
+        hold_total += money(payment.get("amount"))
+    return money(hold_total)
+
 
 
 
