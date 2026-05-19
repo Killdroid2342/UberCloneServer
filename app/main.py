@@ -2908,6 +2908,45 @@ def can_view_ride(current_user: dict, ride: dict) -> bool:
     return False
 
 
+def ride_created_after(ride: dict, cutoff: datetime) -> bool:
+    created_at = parse_datetime(ride.get("created_at"), "created_at")
+    return bool(created_at and created_at >= cutoff)
+
+
+def latest_known_rider_location(rider_id: str) -> dict | None:
+    candidate_rides = sorted(
+        [
+            ride
+            for ride in rides.values()
+            if ride.get("rider_id") == rider_id
+            and (ride.get("rider_location") or ride.get("pickup"))
+        ],
+        key=lambda ride: ride.get("updated_at") or ride.get("created_at") or "",
+        reverse=True,
+    )
+    for ride in candidate_rides:
+        location = parse_location_payload(ride.get("rider_location")) or parse_location_payload(ride.get("pickup"))
+        if location:
+            return location
+    return None
+
+
+def fraud_signal(code: str, label: str, weight: int, metadata: dict | None = None) -> dict:
+    return {
+        "code": code,
+        "label": label,
+        "weight": weight,
+        "metadata": metadata or {},
+    }
+
+
+def fraud_risk_level(score: int) -> str:
+    if score >= FRAUD_REVIEW_SCORE:
+        return "high"
+    if score >= 30:
+        return "medium"
+    return "low"
+
 
 
 
