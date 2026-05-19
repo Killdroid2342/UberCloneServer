@@ -3582,6 +3582,76 @@ def build_admin_fraud_summary() -> dict:
     }
 
 
+def heatmap_bucket(point: dict) -> tuple[float, float]:
+    grid_size = DEMAND_HEATMAP_GRID_SIZE if DEMAND_HEATMAP_GRID_SIZE > 0 else 0.01
+    lat = round(round(float(point["lat"]) / grid_size) * grid_size, 4)
+    lng = round(round(float(point["lng"]) / grid_size) * grid_size, 4)
+    return lat, lng
+
+
+def build_demand_heatmap() -> list[dict]:
+    demand_statuses = {
+        "matching",
+        "pending_driver",
+        "no_drivers_available",
+        "accepted",
+        "arrived",
+    }
+    cells: dict[str, dict] = {}
+
+    for ride in rides.values():
+        if ride.get("status") not in demand_statuses:
+            continue
+        pickup = parse_location_payload(ride.get("pickup"))
+        if not pickup:
+            continue
+
+        lat, lng = heatmap_bucket(pickup)
+        cell_id = f"{lat:.4f}:{lng:.4f}"
+        cell = cells.setdefault(
+            cell_id,
+            {
+                "id": cell_id,
+                "lat": lat,
+                "lng": lng,
+                "count": 0,
+                "queued_count": 0,
+                "pending_count": 0,
+                "vehicle_types": {},
+                "status_counts": {},
+                "latest_request_at": None,
+            },
+        )
+        cell["count"] += 1
+        if ride.get("status") in RIDE_QUEUE_STATUSES:
+            cell["queued_count"] += 1
+        if ride.get("status") == "pending_driver":
+            cell["pending_count"] += 1
+
+        vehicle_type = ride_vehicle_type(ride)
+        cell["vehicle_types"][vehicle_type] = cell["vehicle_types"].get(vehicle_type, 0) + 1
+        status = ride.get("status") or "unknown"
+        cell["status_counts"][status] = cell["status_counts"].get(status, 0) + 1
+
+        latest = ride.get("updated_at") or ride.get("created_at")
+        if latest and (not cell["latest_request_at"] or latest > cell["latest_request_at"]):
+            cell["latest_request_at"] = latest
+
+    max_count = max((cell["count"] for cell in cells.values()), default=1)
+    heatmap = []
+    for cell in cells.values():
+        heatmap.append(
+            {
+                **cell,
+                "intensity": round(cell["count"] / max_count, 2),
+            }
+        )
+
+    return sorted(
+        heatmap,
+        key=lambda cell: (cell["count"], cell.get("latest_request_at") or ""),
+        reverse=True,
+    )
 
 
 def percentage(part: int | float, total: int | float) -> float:
