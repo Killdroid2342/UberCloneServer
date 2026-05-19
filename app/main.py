@@ -2197,6 +2197,59 @@ def create_mock_payment(
     }
 
 
+def generate_receipt_number() -> str:
+    issued_on = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return f"RCPT-{issued_on}-{uuid4().hex[:8].upper()}"
+
+
+def receipt_location_label(location: dict | None) -> str:
+    if not location:
+        return "Not available"
+    try:
+        return f"{float(location['lat']):.5f}, {float(location['lng']):.5f}"
+    except (KeyError, TypeError, ValueError):
+        return "Not available"
+
+
+def receipt_line_items_for(ride: dict, payment: dict) -> list[dict]:
+    currency = payment.get("currency", FARE_CURRENCY)
+    cancellation_fee = payment.get("cancellation_fee") or ride.get("cancellation_fee")
+    if cancellation_fee:
+        return [
+            {
+                "label": "Cancellation fee",
+                "amount": money(cancellation_fee.get("amount")),
+                "currency": cancellation_fee.get("currency", currency),
+            }
+        ]
+
+    breakdown = payment.get("fare_breakdown") or ride.get("fare_breakdown") or {}
+    line_items: list[dict] = []
+
+    for key, label in (
+        ("base_fare", "Base fare"),
+        ("distance_charge", "Distance"),
+        ("time_charge", "Time"),
+        ("vehicle_charge", "Vehicle"),
+        ("surge_charge", "Surge"),
+        ("minimum_adjustment", "Minimum fare adjustment"),
+    ):
+        amount = money(breakdown.get(key))
+        if amount > 0 or key in {"base_fare", "distance_charge", "time_charge"}:
+            line_items.append({"label": label, "amount": amount, "currency": currency})
+
+    promo_discount = money(breakdown.get("promo_discount"))
+    if promo_discount > 0:
+        promo_label = breakdown.get("promo_label") or breakdown.get("promo_code") or "Promotion"
+        line_items.append({"label": str(promo_label), "amount": -promo_discount, "currency": currency})
+
+    if not line_items:
+        line_items.append({"label": "Ride fare", "amount": money(payment.get("amount")), "currency": currency})
+
+    return line_items
+
+
+
 
 
 
