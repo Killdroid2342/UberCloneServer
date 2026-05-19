@@ -2034,6 +2034,40 @@ def fare_breakdown_for(
     )
 
 
+def fare_for(
+    distance_km: float,
+    duration_min: float,
+    vehicle_type: str | None = None,
+    promo_code: str | None = None,
+) -> float:
+    return fare_breakdown_for(distance_km, duration_min, vehicle_type, promo_code)["total"]
+
+
+def default_rider_wallet(created_at: str | None = None) -> dict:
+    balance = money(DEFAULT_RIDER_WALLET_BALANCE)
+    timestamp = created_at or now_iso()
+    transactions = []
+    if balance > 0:
+        transactions.append(
+            {
+                "id": f"wtxn_{uuid4().hex[:12]}",
+                "type": "starter_credit",
+                "amount": balance,
+                "currency": FARE_CURRENCY,
+                "balance_after": balance,
+                "description": "Starter wallet credit",
+                "ride_id": None,
+                "payment_id": None,
+                "created_at": timestamp,
+            }
+        )
+    return {
+        "currency": FARE_CURRENCY,
+        "balance": balance,
+        "transactions": transactions,
+    }
+
+
 
 
 
