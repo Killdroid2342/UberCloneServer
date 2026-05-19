@@ -2730,6 +2730,41 @@ def steps_from_osrm_legs(legs: list) -> list[dict]:
     return route_steps
 
 
+def route_points_from_coordinates(coordinates: list) -> list[dict]:
+    route_points = []
+    for coord in coordinates:
+        if not isinstance(coord, (list, tuple)) or len(coord) < 2:
+            continue
+        lng, lat = coord[:2]
+        if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+            route_points.append({"lat": lat, "lng": lng})
+    return route_points
+
+
+def steps_from_graphhopper_instructions(instructions: list, route_points: list[dict]) -> list[dict]:
+    route_steps: list[dict] = []
+
+    for instruction in instructions:
+        text = (instruction.get("text") or "").strip()
+        if not text:
+            continue
+
+        interval = instruction.get("interval") or []
+        start_index = interval[0] if interval and isinstance(interval[0], int) else None
+        location = route_points[start_index] if start_index is not None and start_index < len(route_points) else None
+        distance_km = (instruction.get("distance") or 0) / 1000
+        duration_min = (instruction.get("time") or 0) / 60000
+
+        route_steps.append(
+            {
+                "instruction": text,
+                "distance_km": round(distance_km, 2),
+                "duration_min": max(0, round(duration_min)),
+                "location": location,
+            }
+        )
+
+    return route_steps
 
 
 def rating_summary_for_user(user_id: str) -> dict:
