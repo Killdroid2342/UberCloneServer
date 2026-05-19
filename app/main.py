@@ -3542,6 +3542,46 @@ def admin_issue_summary(report: dict) -> dict:
     }
 
 
+def public_fraud_event(event: dict) -> dict:
+    ride = rides.get(event.get("ride_id"))
+    rider = riders.get(event.get("rider_id"))
+    return {
+        **event,
+        "rider": user_summary(rider),
+        "ride": admin_ride_summary(ride) if ride else None,
+    }
+
+
+def build_admin_fraud_summary() -> dict:
+    events = sorted(
+        fraud_events.values(),
+        key=lambda event: event.get("created_at", ""),
+        reverse=True,
+    )
+    risk_counts = {
+        level: sum(1 for event in events if event.get("risk_level") == level)
+        for level in ["low", "medium", "high"]
+    }
+    signal_counts: dict[str, int] = {}
+    for event in events:
+        for signal in event.get("signals", []):
+            code = signal.get("code")
+            if code:
+                signal_counts[code] = signal_counts.get(code, 0) + 1
+
+    return {
+        "total_events": len(events),
+        "open_reviews": sum(1 for event in events if not event.get("reviewed_at") and event.get("action") == "review_required"),
+        "blocked_requests": sum(1 for event in events if event.get("action") == "blocked"),
+        "risk_counts": risk_counts,
+        "top_signals": [
+            {"code": code, "count": count}
+            for code, count in sorted(signal_counts.items(), key=lambda item: item[1], reverse=True)[:8]
+        ],
+        "recent_events": [public_fraud_event(event) for event in events[:10]],
+    }
+
+
 
 
 def percentage(part: int | float, total: int | float) -> float:
