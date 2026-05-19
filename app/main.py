@@ -1615,6 +1615,54 @@ def release_driver_for_ride(ride: dict, availability: str = "available") -> None
         driver["availability"] = availability if driver_can_receive_requests(driver) else "offline"
 
 
+def access_token_expires_at() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+
+def refresh_token_expires_at() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+
+
+def create_access_token(user_id: str, role: str) -> str:
+    expire = access_token_expires_at()
+    payload = {
+        "sub": user_id,
+        "role": role,
+        "typ": "access",
+        "jti": uuid4().hex,
+        "exp": expire,
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def create_token(data: dict) -> str:
+    user_id = data.get("sub")
+    role = data.get("role")
+    if not user_id or not role:
+        raise ValueError("Token data requires sub and role")
+    return create_access_token(user_id, role)
+
+
+def refresh_token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def user_store_for_role(role: str) -> dict[str, dict] | None:
+    if role == "rider":
+        return riders
+    if role == "driver":
+        return drivers
+    if role == "admin":
+        ensure_default_admin()
+        return admins
+    return None
+
+
+def user_for_auth(user_id: str, role: str) -> dict | None:
+    store = user_store_for_role(role)
+    return store.get(user_id) if store else None
+
+
 
 def decode_auth_token(token: str | None) -> dict:
     if token is None:
