@@ -2100,6 +2100,72 @@ def active_wallet_holds_for_rider(rider_id: str, exclude_payment_id: str | None 
     return money(hold_total)
 
 
+def public_wallet(rider: dict) -> dict:
+    wallet = ensure_rider_wallet(rider)
+    hold_total = active_wallet_holds_for_rider(rider["id"])
+    balance = money(wallet.get("balance"))
+    return {
+        "currency": wallet.get("currency", FARE_CURRENCY),
+        "balance": balance,
+        "available_balance": money(max(balance - hold_total, 0)),
+        "authorized_hold": hold_total,
+        "transactions": list(wallet.get("transactions") or [])[:10],
+    }
+
+
+def wallet_transaction(
+    rider_id: str,
+    *,
+    transaction_type: str,
+    amount: float,
+    description: str,
+    ride_id: str | None = None,
+    payment_id: str | None = None,
+) -> dict:
+    rider = riders.get(rider_id)
+    wallet = ensure_rider_wallet(rider)
+    next_balance = money(wallet.get("balance")) + money(amount)
+    if next_balance < 0:
+        raise HTTPException(status_code=402, detail="Insufficient wallet balance")
+
+    transaction = {
+        "id": f"wtxn_{uuid4().hex[:12]}",
+        "type": transaction_type,
+        "amount": money(amount),
+        "currency": wallet.get("currency", FARE_CURRENCY),
+        "balance_after": money(next_balance),
+        "description": description,
+        "ride_id": ride_id,
+        "payment_id": payment_id,
+        "created_at": now_iso(),
+    }
+    wallet["balance"] = transaction["balance_after"]
+    wallet.setdefault("transactions", []).insert(0, transaction)
+    return transaction
+
+
+def ensure_wallet_available(rider_id: str, amount: float) -> None:
+    rider = riders.get(rider_id)
+    wallet = public_wallet(rider)
+    if wallet["available_balance"] < money(amount):
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "Insufficient wallet balance. "
+                f"Available {wallet['currency']} {wallet['available_balance']:.2f}, "
+                f"needed {money(amount):.2f}."
+            ),
+        )
+
+
+def normalize_wallet_top_up_amount(value: float | int | str | None) -> float:
+    amount = money(value)
+    if amount < WALLET_TOP_UP_MIN or amount > WALLET_TOP_UP_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Top-up amount must be between {WALLET_TOP_UP_MIN:.0f} and {WALLET_TOP_UP_MAX:.0f}",
+        )
+    return amount
 
 
 def create_mock_payment(
