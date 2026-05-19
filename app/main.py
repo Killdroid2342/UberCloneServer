@@ -2249,6 +2249,102 @@ def receipt_line_items_for(ride: dict, payment: dict) -> list[dict]:
     return line_items
 
 
+def ensure_receipt_for_ride(ride: dict) -> dict | None:
+    payment = ride.get("payment")
+    if not payment or payment.get("status") not in {"paid", "refunded"}:
+        return None
+
+    existing_receipt = payment.get("receipt") if isinstance(payment.get("receipt"), dict) else {}
+    if not payment.get("receipt_number"):
+        payment["receipt_number"] = existing_receipt.get("receipt_number") or generate_receipt_number()
+
+    generated_at = existing_receipt.get("generated_at") or payment.get("captured_at") or now_iso()
+    rider = riders.get(ride.get("rider_id"))
+    driver = drivers.get(ride.get("driver_id"))
+    vehicle = driver.get("vehicle") if isinstance(driver, dict) else None
+
+    receipt = {
+        "id": existing_receipt.get("id") or f"receipt_{uuid4().hex[:12]}",
+        "receipt_number": payment["receipt_number"],
+        "ride_id": ride["id"],
+        "payment_id": payment.get("id"),
+        "type": "cancellation_fee" if payment.get("cancellation_fee") else "ride_fare",
+        "currency": payment.get("currency", FARE_CURRENCY),
+        "subtotal": money(sum(item["amount"] for item in receipt_line_items_for(ride, payment))),
+        "total": money(payment.get("amount")),
+        "status": payment.get("status"),
+        "generated_at": generated_at,
+        "paid_at": payment.get("captured_at"),
+        "refunded_at": payment.get("refunded_at"),
+        "line_items": receipt_line_items_for(ride, payment),
+        "payment": {
+            "method": payment.get("method"),
+            "authorization_code": payment.get("authorization_code"),
+            "wallet_transaction_id": payment.get("wallet_transaction_id"),
+        },
+        "ride": {
+            "status": ride.get("status"),
+            "pickup": ride.get("pickup"),
+            "pickup_label": receipt_location_label(ride.get("pickup")),
+            "destination": ride.get("destination"),
+            "destination_label": receipt_location_label(ride.get("destination")),
+            "distance_km": ride.get("distance_km"),
+            "duration_min": ride.get("duration_min"),
+            "vehicle_type": ride_vehicle_type(ride),
+            "vehicle_type_label": vehicle_type_config(ride_vehicle_type(ride))["label"],
+            "started_at": ride.get("started_at"),
+            "completed_at": ride.get("completed_at"),
+            "cancelled_at": ride.get("cancelled_at"),
+        },
+        "rider": {
+            "id": rider.get("id") if rider else ride.get("rider_id"),
+            "name": rider.get("name", "Rider") if rider else "Rider",
+        },
+        "driver": {
+            "id": driver.get("id") if driver else ride.get("driver_id"),
+            "name": driver.get("name", "Driver") if driver else "Driver",
+            "vehicle": vehicle,
+        }
+        if driver
+        else None,
+        "refund": payment.get("refund"),
+        "email_delivery": existing_receipt.get("email_delivery"),
+    }
+
+    payment["receipt"] = receipt
+    ride["payment"] = payment
+    return receipt
+
+
+def receipt_email_subject(receipt: dict) -> str:
+    return f"Your MyUber receipt {receipt['receipt_number']}"
+
+
+def receipt_email_body(receipt: dict) -> str:
+    ride = receipt.get("ride") or {}
+    driver = receipt.get("driver") or {}
+    lines = [
+        f"MyUber receipt {receipt['receipt_number']}",
+        "",
+        f"Ride: {receipt['ride_id']}",
+        f"Pickup: {ride.get('pickup_label', 'Not available')}",
+        f"Destination: {ride.get('destination_label', 'Not available')}",
+    ]
+    if driver.get("name"):
+        lines.append(f"Driver: {driver['name']}")
+    lines.extend(["", "Charges:"])
+    for item in receipt.get("line_items", []):
+        lines.append(f"- {item['label']}: {item['currency']} {item['amount']:.2f}")
+    lines.extend(
+        [
+            "",
+            f"Total paid: {receipt['currency']} {receipt['total']:.2f}",
+            f"Payment status: {receipt['status']}",
+            "",
+            "Thanks for riding with MyUber.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 
