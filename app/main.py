@@ -1435,6 +1435,55 @@ def default_driver_documents(submitted_at: str | None = None, *, status: str = "
     }
 
 
+def ensure_driver_document_state(driver: dict | None) -> dict:
+    if not driver:
+        return {
+            "status": "pending_review",
+            "required": len(DRIVER_DOCUMENT_TYPES),
+            "verified": 0,
+            "pending": len(DRIVER_DOCUMENT_TYPES),
+            "rejected": 0,
+            "documents": {},
+        }
+
+    created_at = driver.get("created_at") or now_iso()
+    document_verification = driver.get("document_verification")
+    legacy_complete = driver.get("onboarding_status") == "complete"
+    if not isinstance(document_verification, dict):
+        document_verification = {
+            "documents": default_driver_documents(
+                created_at,
+                status="verified" if legacy_complete else "pending_review",
+            )
+        }
+        driver["document_verification"] = document_verification
+
+    documents = document_verification.get("documents")
+    if not isinstance(documents, dict):
+        documents = {}
+        document_verification["documents"] = documents
+
+    for document_type, config in DRIVER_DOCUMENT_TYPES.items():
+        document = documents.get(document_type)
+        if not isinstance(document, dict):
+            document = {
+                **config,
+                "status": "verified" if legacy_complete else "pending_review",
+                "reference": f"{document_type}_{uuid4().hex[:10]}",
+                "submitted_at": created_at,
+                "reviewed_at": created_at if legacy_complete else None,
+                "reviewed_by": "system" if legacy_complete else None,
+            }
+            documents[document_type] = document
+        else:
+            document.update({key: value for key, value in config.items() if key not in document})
+            if document.get("status") not in DRIVER_DOCUMENT_STATUSES:
+                document["status"] = "pending_review"
+
+    return refresh_driver_document_summary(driver)
+
+
+
 
 
 def format_status(status: str | None) -> str:
@@ -1511,6 +1560,8 @@ def release_driver_for_ride(ride: dict, availability: str = "available") -> None
         driver["current_ride_id"] = None
     if driver.get("availability") != "offline":
         driver["availability"] = availability if driver_can_receive_requests(driver) else "offline"
+
+
 
 def decode_auth_token(token: str | None) -> dict:
     if token is None:
@@ -1697,6 +1748,7 @@ def create_mock_payment(
         "receipt_number": None,
         "fare_breakdown": fare_breakdown,
     }
+
 
 
 
@@ -2111,6 +2163,7 @@ def can_view_ride(current_user: dict, ride: dict) -> bool:
 
 
 
+
 def rating_target_for(current_user: dict, ride: dict) -> tuple[str, str]:
     actor_role = current_user["role"]
     actor_id = current_user["user_id"]
@@ -2231,7 +2284,6 @@ def unread_notifications_count(user_id: str, role: str) -> int:
         and notification.get("role") == role
         and not notification.get("read_at")
     )
-
 
 
 
@@ -2405,6 +2457,7 @@ def admin_issue_summary(report: dict) -> dict:
         **report,
         "ride": admin_ride_summary(ride) if ride else None,
     }
+
 
 
 
@@ -3364,7 +3417,6 @@ def get_me(current_user: dict = Depends(get_current_user)):
 
 
 
-
 @app.get("/notifications")
 def get_notifications(current_user: dict = Depends(get_current_user)):
     user_notifications = notifications_for_current_user(current_user)
@@ -3372,10 +3424,6 @@ def get_notifications(current_user: dict = Depends(get_current_user)):
         "unread_count": unread_notifications_count(current_user["user_id"], current_user["role"]),
         "notifications": user_notifications,
     }
-
-
-
-
 
 
 
@@ -3489,7 +3537,6 @@ async def force_admin_driver_offline(
     )
     await persist_runtime_state()
     return admin_driver_summary(driver)
-
 
 
 
@@ -3641,7 +3688,6 @@ async def estimate_route_with_osrm(
 
 
 
-
 @app.post("/routes/estimate")
 async def estimate_route(payload: RouteEstimateRequest):
     vehicle_type = normalize_vehicle_type(payload.get("vehicle_type"))
@@ -3655,35 +3701,6 @@ async def estimate_route(payload: RouteEstimateRequest):
 
 
 
-
-    rides[ride_id] = ride
-    record_fraud_event(
-        fraud_assessment,
-        "review_required" if fraud_assessment["review_required"] else "allowed",
-    )
-    record_audit_event(
-        action="ride.request.created",
-        actor=current_user,
-        target_type="ride",
-        target_id=ride_id,
-        metadata={
-            "status": initial_status,
-            "vehicle_type": vehicle_type,
-            "fare": estimate["fare"],
-            "risk_level": fraud_assessment["risk_level"],
-        },
-    )
-    if scheduled_for:
-        await notify_rider(
-            ride,
-            "Ride scheduled",
-            f"Your {vehicle_type_config(vehicle_type)['label']} ride is scheduled for {scheduled_for}.",
-            "ride_scheduled",
-        )
-    else:
-        await assign_waiting_rides()
-    await persist_runtime_state()
-    return public_ride(ride)
 
 
 @app.post("/rides/{ride_id}/rider-location")
