@@ -3974,6 +3974,61 @@ def waiting_ride_queue() -> list[dict]:
     )
 
 
+def refresh_ride_queue() -> None:
+    queued = waiting_ride_queue()
+    queued_ids = {ride.get("id") for ride in queued}
+    queue_size = len(queued)
+    queue_time = now_iso()
+
+    for position, ride in enumerate(queued, start=1):
+        ride.setdefault("queued_at", ride.get("created_at") or queue_time)
+        ride["queue_position"] = position
+        ride["queue_size"] = queue_size
+
+    for ride in rides.values():
+        if ride.get("id") in queued_ids:
+            continue
+        ride["queue_position"] = None
+        ride["queue_size"] = None
+
+
+def clear_ride_queue_metadata(ride: dict) -> None:
+    ride["queue_position"] = None
+    ride["queue_size"] = None
+
+
+def dispatch_deadline_for(matched_at: str | None = None) -> str:
+    base_time = parse_datetime(matched_at, "matched_at") if matched_at else datetime.now(timezone.utc)
+    return (base_time + timedelta(seconds=DISPATCH_REQUEST_TIMEOUT_SECONDS)).isoformat()
+
+
+def ride_dispatch_deadline(ride: dict) -> datetime | None:
+    expires_at = ride.get("dispatch_expires_at")
+    if expires_at:
+        return parse_datetime(expires_at, "dispatch_expires_at")
+    matched_at = ride.get("matched_at")
+    if matched_at:
+        return parse_datetime(dispatch_deadline_for(matched_at), "dispatch_expires_at")
+    return None
+
+
+def ride_dispatch_expired(ride: dict) -> bool:
+    if ride.get("status") != "pending_driver":
+        return False
+    deadline = ride_dispatch_deadline(ride)
+    return bool(deadline and deadline <= datetime.now(timezone.utc))
+
+
+def due_scheduled_rides() -> list[dict]:
+    now = datetime.now(timezone.utc)
+    due = []
+    for ride in rides.values():
+        if ride.get("status") != "scheduled":
+            continue
+        scheduled_for = ride_scheduled_datetime(ride)
+        if scheduled_for and scheduled_for <= now:
+            due.append(ride)
+    return sorted(due, key=lambda ride: (ride.get("scheduled_for") or "", ride.get("id") or ""))
 
 
 async def postgis_driver_candidates(ride: dict, pickup: Location) -> list[tuple[float, dict]] | None:
