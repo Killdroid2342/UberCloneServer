@@ -2948,7 +2948,196 @@ def fraud_risk_level(score: int) -> str:
     return "low"
 
 
+def assess_ride_fraud(
+    rider_id: str,
+    payload: RideRequest,
+    estimate: dict,
+    ride_id: str,
+) -> dict:
+    rider_rides = [ride for ride in rides.values() if ride.get("rider_id") == rider_id]
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=FRAUD_RECENT_WINDOW_MINUTES)
+    day_cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    recent_requests = [ride for ride in rider_rides if ride_created_after(ride, recent_cutoff)]
+    recent_cancellations = [
+        ride
+        for ride in rider_rides
+        if ride.get("status") == "cancelled" and ride_created_after(ride, day_cutoff)
+    ]
+    active_rides = [
+        ride
+        for ride in rider_rides
+        if ride.get("status") not in TERMINAL_RIDE_STATUSES
+    ]
+    completed_rides = [ride for ride in rider_rides if ride.get("status") == "completed"]
+    signals: list[dict] = []
 
+    if len(recent_requests) >= 5:
+        signals.append(
+            fraud_signal(
+                "rapid_requests",
+                "High number of ride requests in a short window",
+                35,
+                {"recent_requests": len(recent_requests), "window_minutes": FRAUD_RECENT_WINDOW_MINUTES},
+            )
+        )
+    elif len(recent_requests) >= 3:
+        signals.append(
+            fraud_signal(
+                "elevated_request_velocity",
+                "Multiple ride requests in a short window",
+                20,
+                {"recent_requests": len(recent_requests), "window_minutes": FRAUD_RECENT_WINDOW_MINUTES},
+            )
+        )
+
+    if len(active_rides) >= 2:
+        signals.append(
+            fraud_signal(
+                "many_active_rides",
+                "Several active rides already exist for this rider",
+                40,
+                {"active_rides": len(active_rides)},
+            )
+        )
+    elif len(active_rides) == 1:
+        signals.append(
+            fraud_signal(
+                "active_ride_overlap",
+                "Rider already has an active ride",
+                15,
+                {"active_rides": len(active_rides)},
+            )
+        )
+
+    if len(recent_cancellations) >= 4:
+        signals.append(
+            fraud_signal(
+                "repeat_cancellations",
+                "Repeated cancellations in the last 24 hours",
+                30,
+                {"recent_cancellations": len(recent_cancellations)},
+            )
+        )
+    elif len(recent_cancellations) >= 2:
+        signals.append(
+            fraud_signal(
+                "elevated_cancellations",
+                "Multiple cancellations in the last 24 hours",
+                15,
+                {"recent_cancellations": len(recent_cancellations)},
+            )
+        )
+
+    pickup = parse_location_payload(payload.get("pickup"))
+    known_location = latest_known_rider_location(rider_id)
+    if pickup and known_location:
+        pickup_distance_km = haversine_km(known_location, pickup)
+        if pickup_distance_km >= 150:
+            signals.append(
+                fraud_signal(
+                    "impossible_pickup_jump",
+                    "Pickup is far from the rider's last known location",
+                    50,
+                    {"distance_km": round(pickup_distance_km, 1)},
+                )
+            )
+        elif pickup_distance_km >= 50:
+            signals.append(
+                fraud_signal(
+                    "distant_pickup",
+                    "Pickup is unusually far from the rider's last known location",
+                    25,
+                    {"distance_km": round(pickup_distance_km, 1)},
+                )
+            )
+
+    fare = float(estimate.get("fare") or 0)
+    distance_km = float(estimate.get("distance_km") or 0)
+    if fare >= 200:
+        signals.append(
+            fraud_signal(
+                "very_high_fare",
+                "Ride fare is unusually high",
+                30,
+                {"fare": fare, "currency": estimate.get("currency", FARE_CURRENCY)},
+            )
+        )
+    elif fare >= 100:
+        signals.append(
+            fraud_signal(
+                "high_fare",
+                "Ride fare is higher than typical",
+                15,
+                {"fare": fare, "currency": estimate.get("currency", FARE_CURRENCY)},
+            )
+        )
+
+    if distance_km >= 150:
+        signals.append(
+            fraud_signal(
+                "long_distance_trip",
+                "Trip distance is unusually long",
+                20,
+                {"distance_km": round(distance_km, 1)},
+            )
+        )
+
+    if not completed_rides and fare >= 75:
+        signals.append(
+            fraud_signal(
+                "new_rider_high_value",
+                "New rider is requesting a higher-value trip",
+                20,
+                {"completed_rides": 0, "fare": fare},
+            )
+        )
+
+    promo_code = normalize_promo_code(payload.get("promo_code"))
+    if promo_code:
+        promo_uses = sum(1 for ride in rider_rides if ride.get("promo_code") == promo_code)
+        if promo_uses >= 3:
+            signals.append(
+                fraud_signal(
+                    "repeat_promo_use",
+                    "Promo code has been used repeatedly by this rider",
+                    10,
+                    {"promo_code": promo_code, "prior_uses": promo_uses},
+                )
+            )
+
+    score = min(100, sum(int(signal.get("weight", 0)) for signal in signals))
+    return {
+        "id": f"fraud_assess_{uuid4().hex[:12]}",
+        "ride_id": ride_id,
+        "rider_id": rider_id,
+        "risk_score": score,
+        "risk_level": fraud_risk_level(score),
+        "signals": signals,
+        "review_required": score >= FRAUD_REVIEW_SCORE,
+        "blocked": score >= FRAUD_BLOCK_SCORE,
+        "assessed_at": now_iso(),
+    }
+
+
+def record_fraud_event(assessment: dict, action: str) -> dict | None:
+    if assessment.get("risk_score", 0) < 30 and action == "allowed":
+        return None
+
+    event_id = f"fraud_{uuid4().hex[:12]}"
+    event = {
+        "id": event_id,
+        "ride_id": assessment.get("ride_id"),
+        "rider_id": assessment.get("rider_id"),
+        "risk_score": assessment.get("risk_score", 0),
+        "risk_level": assessment.get("risk_level", "low"),
+        "signals": assessment.get("signals", []),
+        "action": action,
+        "created_at": now_iso(),
+        "reviewed_at": None,
+    }
+    fraud_events[event_id] = event
+    assessment["event_id"] = event_id
+    return event
 
 
 def rating_target_for(current_user: dict, ride: dict) -> tuple[str, str]:
