@@ -3262,6 +3262,51 @@ def unread_notifications_count(user_id: str, role: str) -> int:
     )
 
 
+def push_config_payload() -> dict:
+    provider_ready = bool(PUSH_VAPID_PUBLIC_KEY and PUSH_VAPID_PRIVATE_KEY and webpush)
+    return {
+        "enabled": bool(PUSH_VAPID_PUBLIC_KEY),
+        "provider_ready": provider_ready,
+        "public_key": PUSH_VAPID_PUBLIC_KEY if PUSH_VAPID_PUBLIC_KEY else None,
+    }
+
+
+def normalize_push_subscription_payload(payload: dict) -> dict:
+    endpoint = str(payload.get("endpoint") or "").strip()
+    keys = payload.get("keys") or {}
+    p256dh = str(keys.get("p256dh") or "").strip()
+    auth = str(keys.get("auth") or "").strip()
+
+    if not endpoint:
+        raise HTTPException(status_code=400, detail="Push subscription endpoint is required")
+    if not p256dh or not auth:
+        raise HTTPException(status_code=400, detail="Push subscription keys are required")
+
+    return {
+        "endpoint": endpoint,
+        "keys": {"p256dh": p256dh, "auth": auth},
+        "expirationTime": payload.get("expirationTime"),
+    }
+
+
+def push_subscription_id(user_id: str, role: str, endpoint: str) -> str:
+    digest = hashlib.sha256(f"{role}:{user_id}:{endpoint}".encode("utf-8")).hexdigest()
+    return f"push_{digest[:24]}"
+
+
+def public_push_subscription(subscription: dict) -> dict:
+    return {
+        "id": subscription["id"],
+        "role": subscription["role"],
+        "endpoint_hash": hashlib.sha256(subscription["endpoint"].encode("utf-8")).hexdigest()[:16],
+        "expirationTime": subscription.get("expirationTime"),
+        "created_at": subscription["created_at"],
+        "updated_at": subscription["updated_at"],
+        "last_delivery_at": subscription.get("last_delivery_at"),
+        "last_error": subscription.get("last_error"),
+    }
+
+
 
 
 
