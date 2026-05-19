@@ -1738,6 +1738,100 @@ def require_permission(current_user: dict, permission: str) -> str:
     return user_id
 
 
+def issue_refresh_token(
+    user_id: str,
+    role: str,
+    request: Request | None = None,
+    *,
+    family_id: str | None = None,
+    rotated_from: str | None = None,
+) -> tuple[str, dict]:
+    raw_token = secrets.token_urlsafe(48)
+    token_hash = refresh_token_digest(raw_token)
+    created_at = now_iso()
+    expires_at = refresh_token_expires_at().isoformat()
+    record = {
+        "id": f"rt_{uuid4().hex[:16]}",
+        "token_hash": token_hash,
+        "family_id": family_id or f"rtfam_{uuid4().hex[:16]}",
+        "rotated_from": rotated_from,
+        "user_id": user_id,
+        "role": role,
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "last_used_at": None,
+        "revoked_at": None,
+        "revocation_reason": None,
+        "created_by_ip": client_ip_for(request) if request else None,
+        "created_by_user_agent": request.headers.get("User-Agent") if request else None,
+    }
+    refresh_tokens[token_hash] = record
+    return raw_token, record
+
+
+def revoke_refresh_token(record: dict | None, reason: str) -> None:
+    if not record or record.get("revoked_at"):
+        return
+    record["revoked_at"] = now_iso()
+    record["revocation_reason"] = reason
+
+
+def revoke_refresh_token_family(family_id: str | None, reason: str) -> None:
+    if not family_id:
+        return
+    for record in refresh_tokens.values():
+        if record.get("family_id") == family_id:
+            revoke_refresh_token(record, reason)
+
+
+def validate_refresh_token(raw_token: str) -> tuple[dict, dict]:
+    token = str(raw_token or "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Refresh token is required")
+
+    record = refresh_tokens.get(refresh_token_digest(token))
+    if not record:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    if record.get("revoked_at"):
+        revoked_at = parse_datetime(record.get("revoked_at"), "revoked_at")
+        recently_rotated = (
+            record.get("revocation_reason") == "rotated"
+            and revoked_at is not None
+            and revoked_at >= datetime.now(timezone.utc) - timedelta(seconds=30)
+        )
+        if recently_rotated:
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+        revoke_refresh_token_family(record.get("family_id"), "refresh_token_reuse")
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    expires_at = parse_datetime(record.get("expires_at"), "expires_at")
+    if not expires_at or expires_at <= datetime.now(timezone.utc):
+        revoke_refresh_token(record, "expired")
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+
+    user = user_for_auth(record.get("user_id"), record.get("role"))
+    if not user:
+        revoke_refresh_token(record, "user_not_found")
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    ensure_account_active(user)
+    return record, user
+
+
+def auth_response(user: dict, role: str, request: Request | None = None) -> dict:
+    access_token = create_access_token(user["id"], role)
+    refresh_token, _ = issue_refresh_token(user["id"], role, request)
+    return {
+        "token": access_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+        "user": safe_user(user),
+    }
+
 
 def decode_auth_token(token: str | None) -> dict:
     if token is None:
