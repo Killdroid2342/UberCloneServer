@@ -39,6 +39,13 @@ CREATE TABLE IF NOT EXISTS myuber_runtime_state (
     data JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE INDEX IF NOT EXISTS myuber_runtime_state_updated_at_idx
+ON myuber_runtime_state (updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS myuber_runtime_state_data_gin_idx
+ON myuber_runtime_state
+USING GIN (data jsonb_path_ops);
 ```
 
 The `data` JSON object has these top-level keys:
@@ -54,6 +61,8 @@ The `data` JSON object has these top-level keys:
 - `refresh_tokens`
 - `fraud_events`
 - `audit_logs`
+- `domain_events`
+- `idempotency_records`
 
 ### `myuber_driver_locations`
 
@@ -74,6 +83,19 @@ CREATE TABLE IF NOT EXISTS myuber_driver_locations (
 CREATE INDEX IF NOT EXISTS myuber_driver_locations_geo_idx
 ON myuber_driver_locations
 USING GIST (location);
+
+CREATE INDEX IF NOT EXISTS myuber_driver_locations_available_geo_idx
+ON myuber_driver_locations
+USING GIST (location)
+WHERE availability = 'available'
+  AND current_ride_id IS NULL
+  AND account_status = 'active';
+
+CREATE INDEX IF NOT EXISTS myuber_driver_locations_status_idx
+ON myuber_driver_locations (availability, account_status, current_ride_id);
+
+CREATE INDEX IF NOT EXISTS myuber_driver_locations_updated_at_idx
+ON myuber_driver_locations (updated_at DESC);
 ```
 
 This table is rebuilt from the in-memory `drivers` dictionary during persistence.
@@ -100,7 +122,10 @@ erDiagram
     DRIVER ||--o{ REFRESH_TOKEN : owns
     ADMIN ||--o{ REFRESH_TOKEN : owns
     ADMIN ||--o{ AUDIT_LOG : writes
+    ADMIN ||--o{ DOMAIN_EVENT : observes
     DRIVER ||--o| DRIVER_LOCATION_INDEX : projects
+    RIDE ||--o{ DOMAIN_EVENT : emits
+    RIDER ||--o{ IDEMPOTENCY_RECORD : scopes
     ADMIN ||--o{ RIDER : manages
     ADMIN ||--o{ DRIVER : manages
 
@@ -156,6 +181,29 @@ erDiagram
         string client_ip
         string user_agent
         string created_at
+    }
+
+    DOMAIN_EVENT {
+        string id PK
+        string type
+        string aggregate_type
+        string aggregate_id
+        object payload
+        object actor
+        string source
+        string region
+        string instance_id
+        string correlation_id
+        string created_at
+    }
+
+    IDEMPOTENCY_RECORD {
+        string scope PK
+        string payload_hash
+        number status_code
+        object body
+        string created_at
+        string expires_at
     }
 
     DRIVER {
@@ -346,4 +394,5 @@ flowchart TD
   lifetime.
 - PostGIS is optional; without it, matching uses in-memory distance sorting.
 - Redis is not part of durable storage. It is used for route/location caching
-  and websocket fanout across API instances.
+  websocket fanout, Redis-backed idempotency records, and domain event
+  publication across API instances.

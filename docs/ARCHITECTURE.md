@@ -13,6 +13,8 @@ flowchart LR
     API["FastAPI app\nMyUberServer"]
     Runtime["Runtime dictionaries\nriders drivers rides notifications"]
     Security["Security controls\nrate limits refresh tokens fraud events"]
+    Platform["Platform controls\nfeature flags API versions drain circuit breakers"]
+    Events["Domain event log\nRedis event publishing"]
     Postgres["PostgreSQL + PostGIS\noptional durable runtime state\nand driver location index"]
     Redis["Redis\noptional cache and realtime pubsub"]
     Nominatim["OpenStreetMap Nominatim\nlocation search"]
@@ -23,8 +25,10 @@ flowchart LR
     Browser <-->|WebSockets| API
     API --> Runtime
     API --> Security
+    API --> Platform
+    API --> Events
     API -->|upsert JSONB and driver index| Postgres
-    API <-->|cache and pubsub| Redis
+    API <-->|cache pubsub idempotency event bus| Redis
     API -->|GET /search| Nominatim
     API -->|route requests| Routing
 ```
@@ -36,7 +40,12 @@ The FastAPI app handles:
 - account signup/login for riders, drivers, and admins
 - short-lived JWT auth, rotating refresh tokens, and role checks
 - rate limiting for sensitive and high-volume HTTP endpoints
+- API version prefixes and response headers for v1-compatible clients
+- feature flags for controlled rollout of platform capabilities
+- idempotency keys for retry-safe ride creation and wallet top-ups
 - basic fraud/risk scoring during ride creation and admin risk reporting
+- circuit breakers around external routing, search, notification, and Redis
+  publishing dependencies
 - account suspension and admin operations
 - driver document verification gates availability and dispatch eligibility
 - location search through Nominatim
@@ -47,6 +56,9 @@ The FastAPI app handles:
 - driver availability, location updates, and earnings
 - notification creation and unread counts
 - WebSocket fanout for rides, drivers, and public share links
+- domain event logging and Redis publication for key platform, wallet,
+  notification, and ride mutations
+- graceful drain mode for rolling deploys and multi-region failover readiness
 
 ## Frontend Responsibilities
 
@@ -102,6 +114,31 @@ flowchart TD
 If Redis is unavailable or not configured, realtime still works for clients
 connected to the same API process.
 
+## Platform Readiness
+
+```mermaid
+flowchart LR
+    Request["HTTP request"]
+    Version["API version resolver\n/v1 or X-API-Version"]
+    Drain["Drain gate\nreject new work during shutdown"]
+    Handler["FastAPI handler"]
+    Idempotency["Idempotency store\nmemory or Redis"]
+    Breaker["Circuit breaker registry"]
+    DomainEvent["Domain event log"]
+    RedisEvents["Redis domain event channel"]
+
+    Request --> Version --> Drain --> Handler
+    Handler --> Idempotency
+    Handler --> Breaker
+    Handler --> DomainEvent
+    DomainEvent --> RedisEvents
+```
+
+Health and admin platform responses expose release version, API version, current
+region, primary region, active regions, feature flags, breaker state, event bus
+state, and drain status. `/health/ready` returns `503` while the process is
+draining, but `/health/live` continues to report process liveness.
+
 ## Data And Failure Behavior
 
 - If `DATABASE_URL` is missing or PostgreSQL connection fails, the app uses
@@ -109,9 +146,11 @@ connected to the same API process.
 - If PostGIS setup fails, nearest-driver matching falls back to Haversine
   sorting in Python.
 - If Redis is missing or unavailable, caching and cross-instance websocket
-  fanout are skipped.
+  fanout are skipped; idempotency and event logging fall back to in-process
+  memory.
 - If the configured routing provider fails, route estimates fall back to an
-  adjusted straight-line estimate.
+  adjusted straight-line estimate. Repeated provider failures open the relevant
+  circuit breaker until the configured recovery window elapses.
 - A default admin is created at startup from `MYUBER_ADMIN_EMAIL` and
   `MYUBER_ADMIN_PASSWORD`.
 - JWT signing uses `MYUBER_SECRET_KEY`. If it is missing, the API generates a

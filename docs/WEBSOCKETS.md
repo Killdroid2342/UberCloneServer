@@ -16,6 +16,10 @@ The server exposes three realtime sockets. The TypeScript client wraps them in
   `online`, `pageshow`, or visible `visibilitychange`.
 - Heartbeats close the socket if a `pong` is not received within 10 seconds.
 - Up to 30 outbound messages are queued while disconnected.
+- Realtime messages include `event_id`, `sequence`, and `delivery` metadata.
+  The transport is at-least-once; clients use `event_id` to apply messages once.
+- If the socket is reconnecting, the browser polls
+  `/realtime/{target}/{target_id}/events` for missed ordered events.
 - Location updates are also persisted in the client offline queue so the latest
   point can flush after reload or network recovery.
 - Invalid auth or unauthorized resource access closes with code `1008`.
@@ -283,12 +287,22 @@ Internal event shape:
 
 ```json
 {
+  "id": "rt_abc123",
   "origin": "api-instance-uuid",
   "target": "ride",
   "target_id": "ride-or-driver-or-share-id",
+  "sequence": 42,
+  "created_at": "2026-05-17T00:00:00.000Z",
   "message": {
     "type": "ride_update",
-    "ride": {}
+    "ride": {},
+    "event_id": "rt_abc123",
+    "sequence": 42,
+    "delivery": {
+      "mode": "at_least_once",
+      "dedupe": "event_id",
+      "ordering": "per_target_sequence"
+    }
   }
 }
 ```
@@ -301,3 +315,34 @@ Targets:
 
 The publishing instance also dispatches locally before publishing. Subscriber
 instances ignore events with their own `origin` to avoid duplicate delivery.
+
+## Delivery Guarantees
+
+- Server fanout is at-least-once. Redis publishes are retried with exponential
+  backoff using `MYUBER_REALTIME_REDIS_PUBLISH_ATTEMPTS` and
+  `MYUBER_REALTIME_REDIS_RETRY_BASE_MS`.
+- Client application is effectively exactly-once per stream because
+  `MyUberClient/src/socket.ts` drops duplicate `event_id` values.
+- Ordering is per target, using a monotonically increasing `sequence` for each
+  `ride`, `driver`, or `share` stream.
+- Failed Redis publishes are stored in the in-process realtime dead letter queue
+  after retries. Counts appear under `/admin/observability` in
+  `realtime.delivery`.
+- A bounded in-process event log is kept per target for WebSocket fallback
+  polling.
+
+## Fallback Events
+
+The fallback endpoint returns ordered events newer than the caller's last
+sequence:
+
+```http
+GET /realtime/ride/{ride_id}/events?after_sequence=41&limit=50
+GET /realtime/driver/{driver_id}/events?after_sequence=41&limit=50
+GET /realtime/share/{share_token}/events?after_sequence=41&limit=50
+```
+
+Ride and driver streams use the same permissions as their WebSocket endpoints.
+Share streams remain public to holders of a valid share token. The response
+contains `fallback_poll_seconds` and an `events` array whose `message` values
+match the WebSocket server-to-client payloads.

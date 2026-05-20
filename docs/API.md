@@ -6,16 +6,28 @@ held in runtime dictionaries and can optionally be persisted to PostgreSQL.
 ## Basics
 
 - Base URL: `http://localhost:8000`
+- Versioned Base URL: `http://localhost:8000/v1`
 - Content type: `application/json`
 - Authenticated requests use `Authorization: Bearer <token>`.
+- API versioning supports `/v1/...` path prefixes and the `X-API-Version`
+  request header. Responses include `X-API-Version` and
+  `X-API-Supported-Versions`.
 - Login endpoints return a short-lived JWT access token plus a rotating opaque
   refresh token. The default access-token lifetime is 15 minutes; refresh tokens
   default to 30 days.
+- Retryable write endpoints such as `POST /rides` and `POST /wallet/top-up`
+  accept `Idempotency-Key`. Reusing the same key and payload returns the stored
+  response with `Idempotency-Replayed: true`; reusing a key with a different
+  payload returns `409`.
 - Responses include an `X-Request-ID` header. Send `X-Request-ID` on the
   request to preserve your own correlation ID in API logs and error bodies.
 - Error responses preserve the `detail` field and include `request_id`.
 - Rate-limited responses return `429`, `Retry-After`, and `X-RateLimit-*`
   headers. Normal responses include the current `X-RateLimit-*` window headers.
+- Paginated list endpoints accept `page` and `page_size`. Pages start at `1`,
+  and `page_size` is capped by `MYUBER_MAX_PAGE_SIZE` (default `200`).
+  Paginated responses include a `pagination` object with totals and next/previous
+  flags.
 - Common error codes:
   - `400`: validation or unsupported input
   - `401`: missing or invalid token
@@ -196,6 +208,15 @@ Response:
 {
   "status": "MyUber API running",
   "storage": {
+    "api_version": "v1",
+    "api_versions": ["v1"],
+    "region": {
+      "region": "eu-west-2",
+      "primary_region": "eu-west-2",
+      "active_regions": ["eu-west-2"],
+      "multi_region_ready": true
+    },
+    "features": {},
     "postgres": { "configured": true, "connected": true },
     "postgis": { "enabled": true },
     "redis": {
@@ -231,6 +252,74 @@ Response:
 Returns the storage, routing, and security configuration status object.
 
 Auth: none
+
+### `GET /features`
+
+Returns public feature flags plus API version and region metadata.
+
+Auth: none
+
+Response:
+
+```json
+{
+  "api_version": "v1",
+  "release_version": "0.1.0",
+  "region": "local",
+  "features": {
+    "api_versioning": true,
+    "circuit_breakers": true,
+    "event_bus": true,
+    "graceful_draining": true,
+    "idempotency_keys": true,
+    "multi_region_metadata": true
+  }
+}
+```
+
+### `GET /health/live`
+
+Returns liveness status for process-level probes.
+
+Auth: none
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "service": "myuber-api",
+  "environment": "development",
+  "api_version": "v1",
+  "region": "local",
+  "instance_id": "uuid",
+  "generated_at": "2026-05-17T00:00:00+00:00",
+  "uptime_seconds": 123.45,
+  "draining": false
+}
+```
+
+### `GET /health/ready`
+
+Returns readiness status for dependency-aware probes. The endpoint returns `503`
+when a configured dependency or required background task is unhealthy.
+
+Auth: none
+
+Response:
+
+```json
+{
+  "status": "ready",
+  "ready": true,
+  "checks": {
+    "database": { "configured": true, "connected": true, "ok": true },
+    "redis": { "configured": true, "connected": true, "ok": true },
+    "background": { "scheduled_rides_task_running": true, "ok": true },
+    "drain": { "draining": false, "ok": true }
+  }
+}
+```
 
 ### `GET /vehicle-types`
 
@@ -476,11 +565,28 @@ drivers receive fixed role permissions for their own resources. Admins receive
 an `admin_role` and `permissions`; the default admin is `super_admin` and can
 read operations, fraud, audit logs, observability, and manage users/drivers.
 
+## Platform Readiness
+
+The API includes platform controls for multi-region deployments and controlled
+rollouts:
+
+- Multi-region metadata is returned by health/storage/admin platform payloads.
+  Set `MYUBER_REGION`, `MYUBER_PRIMARY_REGION`, and `MYUBER_ACTIVE_REGIONS`.
+- Feature flags are read from `MYUBER_FEATURE_FLAGS` and
+  `MYUBER_FEATURE_FLAG_<NAME>` environment variables.
+- Circuit breakers track external routing, search, Redis event publishing,
+  SMTP, and Web Push failures. Open breakers are visible in admin
+  observability and storage status.
+- Graceful drain mode makes `/health/ready` return `503` and rejects new
+  non-platform requests with `503` while liveness remains healthy.
+- Domain events are appended for key platform, wallet, notification, and ride
+  mutations, and are published to Redis when Redis is connected.
+
 ## Notifications
 
-### `GET /notifications`
+### `GET /notifications?page=1&page_size=50`
 
-Returns notifications for the current user.
+Returns paginated notifications for the current user.
 
 Auth: rider, driver, or admin
 
@@ -501,7 +607,15 @@ Response:
       "read_at": null,
       "created_at": "2026-05-17T00:00:00+00:00"
     }
-  ]
+  ],
+  "pagination": {
+    "page": 1,
+    "page_size": 50,
+    "total_items": 1,
+    "total_pages": 1,
+    "has_next": false,
+    "has_previous": false
+  }
 }
 ```
 
@@ -561,6 +675,10 @@ Request:
 ```
 
 Response: wallet payload
+
+Notes:
+
+- Supports `Idempotency-Key` to prevent duplicate credits during client retries.
 
 ### `POST /notifications/read-all`
 
@@ -665,24 +783,68 @@ Fraud summary:
 }
 ```
 
-### `GET /admin/fraud-events`
+### `GET /admin/fraud-events?page=1&page_size=50`
 
-Returns the full basic fraud event stream and the same summary used by the
-admin dashboard.
+Returns paginated basic fraud events and the same summary used by the admin
+dashboard.
 
 Auth: admin with `admin.fraud.read`
 
 Events include the rider summary, related ride summary when a ride was created,
 `risk_score`, `risk_level`, signal codes, action (`allowed`, `review_required`,
-or `blocked`), and review timestamps.
+or `blocked`), review timestamps, and pagination metadata.
 
-### `GET /admin/audit-logs?limit=50`
+### `GET /admin/audit-logs?page=1&page_size=50`
 
-Returns recent security and operations audit events plus action/outcome counts.
-Events include actor role/user summary, target type/id, safe metadata, request
-ID, client IP, user agent, outcome, and timestamp.
+Returns paginated security and operations audit events plus action/outcome
+counts. Events include actor role/user summary, target type/id, safe metadata,
+request ID, client IP, user agent, outcome, and timestamp.
 
 Auth: admin with `admin.audit.read`
+
+Notes:
+
+- The legacy `limit` query parameter is still accepted as a page-size alias.
+
+### `GET /admin/events?page=1&page_size=50&event_type=ride.requested`
+
+Returns paginated domain events from the in-process event log plus event bus
+status. Omit `event_type` to list all events.
+
+Auth: admin with `admin.audit.read`
+
+### `GET /admin/platform`
+
+Returns service health metadata, region readiness, feature flags, drain status,
+circuit breaker state, event bus state, and storage status.
+
+Auth: admin with `admin.observability.read`
+
+### `POST /admin/platform/drain`
+
+Toggles graceful drain mode for the current instance.
+
+Auth: admin with `admin.platform.manage`
+
+Request:
+
+```json
+{
+  "draining": true,
+  "reason": "rolling-deploy"
+}
+```
+
+Response:
+
+```json
+{
+  "enabled": true,
+  "draining": true,
+  "started_at": "2026-05-17T00:00:00+00:00",
+  "reason": "rolling-deploy"
+}
+```
 
 ### `GET /admin/observability`
 
@@ -921,10 +1083,115 @@ Notes:
 
 - Provider is selected by `ROUTING_PROVIDER`: `osrm` or `graphhopper`.
 - Redis caches successful route payloads when configured.
+- Circuit breakers short-circuit repeated provider failures and allow the API to
+  return fallback estimates quickly.
 - `vehicle_type` defaults to `standard` and changes the fare multiplier.
 - Supported demo promo codes are `SAVE10`, `MYUBER5`, and `WELCOME20`.
 - If the external provider fails, the API returns a fallback straight-line
   estimate adjusted for driving distance.
+
+### `GET /geofences`
+
+Returns the built-in service-area, airport, and restricted-zone geofences used
+by local routing demos.
+
+Auth: none
+
+### `POST /geofences/evaluate`
+
+Checks whether a location is inside the built-in geofences, or a custom list of
+circle/polygon geofences supplied in the request.
+
+Auth: none
+
+Request:
+
+```json
+{
+  "location": { "lat": 51.5074, "lng": -0.1278 }
+}
+```
+
+Response includes `serviceable`, `matches`, and every evaluated geofence with
+distance-to-center and distance-to-boundary fields.
+
+### `POST /routes/snap-to-road`
+
+Snaps GPS points to OSRM road geometry when available. If a `route` polyline is
+provided, the API snaps each point to that local route geometry without calling
+an external provider.
+
+Auth: none
+
+Request:
+
+```json
+{
+  "points": [{ "lat": 51.508, "lng": -0.127 }],
+  "route": [
+    { "lat": 51.5074, "lng": -0.1278 },
+    { "lat": 51.5155, "lng": -0.1419 }
+  ],
+  "radius_meters": 35
+}
+```
+
+### `POST /routes/alternatives`
+
+Returns up to five ranked route estimates for the same pickup/destination pair.
+OSRM and GraphHopper alternatives are used when available; otherwise the API
+returns deterministic fallback alternatives.
+
+Auth: none
+
+Request:
+
+```json
+{
+  "pickup": { "lat": 51.5074, "lng": -0.1278 },
+  "destination": { "lat": 51.5155, "lng": -0.1419 },
+  "max_alternatives": 3
+}
+```
+
+### `POST /routes/distance-matrix`
+
+Returns origin-destination distance and duration matrices. The request is capped
+at 25 origins, 25 destinations, and 100 total cells.
+
+Auth: none
+
+Request:
+
+```json
+{
+  "origins": [{ "lat": 51.5074, "lng": -0.1278 }],
+  "destinations": [
+    { "lat": 51.5155, "lng": -0.1419 },
+    { "lat": 51.4700, "lng": -0.4543 }
+  ]
+}
+```
+
+### `POST /traffic/simulate`
+
+Applies a deterministic traffic scenario to a route estimate and returns the
+base estimate, traffic-adjusted estimate, delay, congestion level, and route
+segments.
+
+Auth: none
+
+Scenarios: `current`, `free_flow`, `normal`, `moderate`, `heavy`, `severe`.
+
+Request:
+
+```json
+{
+  "pickup": { "lat": 51.5074, "lng": -0.1278 },
+  "destination": { "lat": 51.5155, "lng": -0.1419 },
+  "scenario": "heavy"
+}
+```
 
 ## Rides
 
@@ -966,6 +1233,8 @@ Side effects:
   and are automatically rematched if the driver does not respond.
 - If no matching driver is available, keeps the ride in the queue with
   `queue_position` and `queue_size` and marks it `no_drivers_available`.
+- Supports `Idempotency-Key` to prevent duplicate ride creation during client
+  retries.
 
 ### `POST /rides/{ride_id}/rider-location`
 
@@ -990,6 +1259,28 @@ Returns rides for the current rider or driver, newest first.
 Auth: rider or driver
 
 Response: `Ride[]`
+
+### `GET /rides/history?page=1&page_size=50`
+
+Returns a paginated ride history response.
+
+Auth: rider or driver
+
+Response:
+
+```json
+{
+  "rides": [],
+  "pagination": {
+    "page": 1,
+    "page_size": 50,
+    "total_items": 0,
+    "total_pages": 0,
+    "has_next": false,
+    "has_previous": false
+  }
+}
+```
 
 ### `GET /rides/{ride_id}`
 
