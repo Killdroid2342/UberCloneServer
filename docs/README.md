@@ -1,6 +1,8 @@
 # MyUber Server Docs
 
-These docs belong with the FastAPI backend repository.
+This directory is the detailed documentation set for the FastAPI backend. The
+root [README](../README.md) covers quick local setup; this file is the map for
+API, architecture, environment, realtime, and data-model references.
 
 | Document | Covers |
 | --- | --- |
