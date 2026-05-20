@@ -1,7 +1,14 @@
 .env
 .env.local
+.env.development
+.env.staging
+.env.production
+.env.*
+!.env*.example
 
 venv/
+.venv/
+env/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -9,3 +16,11 @@ __pycache__/
 .ruff_cache/
 
 *.log
+.coverage
+coverage/
+htmlcov/
+
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
