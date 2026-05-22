@@ -281,7 +281,7 @@ Only heartbeat is handled:
 ## Redis Fanout
 
 When `REDIS_URL` is configured, each API instance publishes realtime events on
-`REDIS_CHANNEL`, defaulting to `myuber:realtime`.
+`REDIS_CHANNEL`, defaulting to `rideops:realtime`.
 
 Internal event shape:
 
