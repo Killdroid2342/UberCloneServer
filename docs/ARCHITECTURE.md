@@ -1,8 +1,16 @@
-# Architecture Diagram
+﻿# Architecture Diagram
 
-MyUber is a small ride-hailing demo application with a TypeScript browser
+RideOps is a small ride-hailing demo application with a TypeScript browser
 client, a FastAPI backend, optional PostgreSQL/PostGIS persistence, optional
 Redis cache/pubsub, and external map/routing providers.
+
+## Code Organization
+
+The backend keeps `app/main.py` as the FastAPI composition root and
+`app/seed.py` as the demo fixture builder. Shared behavior is documented around
+observable contracts: the API surface, runtime data model, ride lifecycle,
+WebSocket messages, and environment configuration. Future extraction should
+start with pure business policy and tests before adding package structure.
 
 ## System Diagram
 
@@ -12,7 +20,7 @@ flowchart LR
     Static["Static client files"]
     API["FastAPI app\nMyUberServer"]
     Runtime["Runtime dictionaries\nriders drivers rides notifications"]
-    Security["Security controls\nrate limits refresh tokens fraud events"]
+    Security["Security controls\nvalidation XSS headers rate limits\nrefresh tokens abuse/fraud events"]
     Platform["Platform controls\nfeature flags API versions drain circuit breakers"]
     Events["Domain event log\nRedis event publishing"]
     Postgres["PostgreSQL + PostGIS\noptional durable runtime state\nand driver location index"]
@@ -38,12 +46,15 @@ flowchart LR
 The FastAPI app handles:
 
 - account signup/login for riders, drivers, and admins
+- request input validation, display-text sanitization, and security response
+  headers
 - short-lived JWT auth, rotating refresh tokens, and role checks
 - rate limiting for sensitive and high-volume HTTP endpoints
 - API version prefixes and response headers for v1-compatible clients
 - feature flags for controlled rollout of platform capabilities
 - idempotency keys for retry-safe ride creation and wallet top-ups
-- basic fraud/risk scoring during ride creation and admin risk reporting
+- basic fraud/risk scoring during ride creation, abuse-event detection, and
+  admin risk reporting
 - circuit breakers around external routing, search, notification, and Redis
   publishing dependencies
 - account suspension and admin operations
@@ -100,7 +111,7 @@ flowchart TD
     Mutation["Ride or driver mutation"]
     Broadcast["broadcast_ride() or broadcast_driver()"]
     LocalSockets["Local websocket connections"]
-    RedisPub["Redis publish\nmyuber:realtime"]
+    RedisPub["Redis publish\nrideops:realtime"]
     OtherAPI["Other API instances"]
     OtherSockets["Other instance websocket connections"]
 
@@ -155,7 +166,12 @@ draining, but `/health/live` continues to report process liveness.
   `MYUBER_ADMIN_PASSWORD`.
 - JWT signing uses `MYUBER_SECRET_KEY`. If it is missing, the API generates a
   temporary in-memory secret and logs a warning.
+- Passwords are hashed with bcrypt. Signup passwords are length-checked before
+  hashing and password hashes are never returned by public profile serializers.
 - Access tokens default to 15 minutes. Refresh tokens default to 30 days, are
-  stored server-side only as hashes, and rotate on every refresh.
+  stored server-side only as hashes, rotate on every refresh, and token-family
+  reuse is recorded as abuse.
 - Rate limiting uses Redis counters when Redis is connected and in-memory
   counters otherwise.
+- PostgreSQL writes use static SQL and asyncpg bind parameters; user input is
+  not interpolated into SQL statements.
