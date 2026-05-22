@@ -1,8 +1,17 @@
-# MyUber Server
+﻿# RideOps Server
 
-FastAPI backend for the MyUber demo app.
+FastAPI backend for the RideOps full-stack portfolio demo. It provides auth,
+ride lifecycle workflows, realtime updates, mock payments, notifications,
+operations dashboards, optional PostgreSQL/Redis integrations, and local-first
+fallback behavior.
 
 ## Run Locally
+
+From this project directory, the quickest workspace setup path is:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ..\setup.ps1 -Start
+```
 
 Install dependencies from `requirements.txt`, configure `.env` as needed, then run
 the FastAPI app with Uvicorn.
@@ -29,3 +38,4 @@ Key references:
 - [Swagger/OpenAPI](docs/OPENAPI.md)
 - [Environment configuration](docs/ENVIRONMENT.md)
 - [Architecture overview](docs/ARCHITECTURE.md)
+- [Development tooling](docs/DEVELOPMENT.md)
