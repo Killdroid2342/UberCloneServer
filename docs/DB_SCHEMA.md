@@ -1,6 +1,6 @@
-# DB Schema Diagram
+﻿# DB Schema Diagram
 
-MyUber uses runtime dictionaries as the primary domain store. When
+RideOps uses runtime dictionaries as the primary domain store. When
 `DATABASE_URL` is configured, the server persists those dictionaries into a
 single JSONB row and maintains a separate PostGIS-backed driver location index
 for nearest-driver queries.
@@ -29,22 +29,22 @@ erDiagram
     }
 ```
 
-### `myuber_runtime_state`
+### `rideops_runtime_state`
 
 Stores one row with `id = "runtime"`.
 
 ```sql
-CREATE TABLE IF NOT EXISTS myuber_runtime_state (
+CREATE TABLE IF NOT EXISTS rideops_runtime_state (
     id TEXT PRIMARY KEY,
     data JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS myuber_runtime_state_updated_at_idx
-ON myuber_runtime_state (updated_at DESC);
+CREATE INDEX IF NOT EXISTS rideops_runtime_state_updated_at_idx
+ON rideops_runtime_state (updated_at DESC);
 
-CREATE INDEX IF NOT EXISTS myuber_runtime_state_data_gin_idx
-ON myuber_runtime_state
+CREATE INDEX IF NOT EXISTS rideops_runtime_state_data_gin_idx
+ON rideops_runtime_state
 USING GIN (data jsonb_path_ops);
 ```
 
@@ -60,16 +60,17 @@ The `data` JSON object has these top-level keys:
 - `trip_shares`
 - `refresh_tokens`
 - `fraud_events`
+- `abuse_events`
 - `audit_logs`
 - `domain_events`
 - `idempotency_records`
 
-### `myuber_driver_locations`
+### `rideops_driver_locations`
 
 Stores a query-optimized projection of driver locations.
 
 ```sql
-CREATE TABLE IF NOT EXISTS myuber_driver_locations (
+CREATE TABLE IF NOT EXISTS rideops_driver_locations (
     driver_id TEXT PRIMARY KEY,
     location GEOGRAPHY(Point, 4326) NOT NULL,
     lat DOUBLE PRECISION NOT NULL,
@@ -80,22 +81,22 @@ CREATE TABLE IF NOT EXISTS myuber_driver_locations (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS myuber_driver_locations_geo_idx
-ON myuber_driver_locations
+CREATE INDEX IF NOT EXISTS rideops_driver_locations_geo_idx
+ON rideops_driver_locations
 USING GIST (location);
 
-CREATE INDEX IF NOT EXISTS myuber_driver_locations_available_geo_idx
-ON myuber_driver_locations
+CREATE INDEX IF NOT EXISTS rideops_driver_locations_available_geo_idx
+ON rideops_driver_locations
 USING GIST (location)
 WHERE availability = 'available'
   AND current_ride_id IS NULL
   AND account_status = 'active';
 
-CREATE INDEX IF NOT EXISTS myuber_driver_locations_status_idx
-ON myuber_driver_locations (availability, account_status, current_ride_id);
+CREATE INDEX IF NOT EXISTS rideops_driver_locations_status_idx
+ON rideops_driver_locations (availability, account_status, current_ride_id);
 
-CREATE INDEX IF NOT EXISTS myuber_driver_locations_updated_at_idx
-ON myuber_driver_locations (updated_at DESC);
+CREATE INDEX IF NOT EXISTS rideops_driver_locations_updated_at_idx
+ON rideops_driver_locations (updated_at DESC);
 ```
 
 This table is rebuilt from the in-memory `drivers` dictionary during persistence.
@@ -118,9 +119,12 @@ erDiagram
     RIDER ||--o{ NOTIFICATION : receives
     RIDER ||--o{ REFRESH_TOKEN : owns
     RIDER ||--o{ FRAUD_EVENT : triggers
+    RIDER ||--o{ ABUSE_EVENT : triggers
     DRIVER ||--o{ NOTIFICATION : receives
     DRIVER ||--o{ REFRESH_TOKEN : owns
+    DRIVER ||--o{ ABUSE_EVENT : triggers
     ADMIN ||--o{ REFRESH_TOKEN : owns
+    ADMIN ||--o{ ABUSE_EVENT : triggers
     ADMIN ||--o{ AUDIT_LOG : writes
     ADMIN ||--o{ DOMAIN_EVENT : observes
     DRIVER ||--o| DRIVER_LOCATION_INDEX : projects
@@ -166,6 +170,21 @@ erDiagram
         string risk_level
         array signals
         string action
+        string created_at
+    }
+
+    ABUSE_EVENT {
+        string id PK
+        string kind
+        string label
+        string severity
+        object actor
+        string target_type
+        string target_id
+        object metadata
+        string request_id
+        string client_ip
+        string user_agent
         string created_at
     }
 
@@ -373,7 +392,7 @@ registration documents plus aggregate counts and a `status` of
 flowchart TD
     Mutation["API mutation updates runtime dictionaries"]
     Persist["persist_runtime_state()"]
-    RuntimeRow["Upsert myuber_runtime_state runtime JSONB row"]
+    RuntimeRow["Upsert rideops_runtime_state runtime JSONB row"]
     SyncIndex["sync_driver_location_index()"]
     DeleteIndex["Delete existing driver location projection"]
     InsertIndex["Insert active driver location rows"]
