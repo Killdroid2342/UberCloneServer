@@ -19,6 +19,7 @@ __pycache__/
 .coverage
 coverage/
 htmlcov/
+openapi.json
 
 .DS_Store
 Thumbs.db
