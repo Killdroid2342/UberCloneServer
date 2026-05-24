@@ -6,6 +6,8 @@ single JSONB row and maintains a separate PostGIS-backed driver location index
 for nearest-driver queries.
 
 Schema creation happens at FastAPI startup in `initialize_database()`.
+For setup, seed, restart verification, and backup commands, see the
+[persistence guide](PERSISTENCE.md).
 
 ## Physical PostgreSQL Schema
 

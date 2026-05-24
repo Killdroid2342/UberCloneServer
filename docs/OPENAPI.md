@@ -5,7 +5,7 @@ views.
 
 ## Local URLs
 
-Start the API from `MyUberServer`:
+Start the API from `RideOpsServer`:
 
 ```powershell
 uvicorn app.main:app --reload

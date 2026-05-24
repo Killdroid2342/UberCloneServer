@@ -49,5 +49,5 @@ Export the FastAPI OpenAPI schema for generated clients and contract review:
 ```
 
 The browser client keeps its route-level request and response contract in
-`MyUberClient\src\api-contract.ts`; compare it against this schema when adding
+`RideOpsClient\src\api-contract.ts`; compare it against this schema when adding
 or changing routes.
