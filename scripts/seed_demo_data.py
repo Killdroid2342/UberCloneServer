@@ -6,12 +6,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Seed MyUber demo accounts and rides.")
+    parser = argparse.ArgumentParser(description="Seed RideOps demo accounts and rides.")
     parser.add_argument(
         "--env-file",
         default=None,
@@ -21,6 +20,16 @@ def parse_args() -> argparse.Namespace:
         "--reset",
         action="store_true",
         help="Clear existing runtime state before seeding.",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Use fixed seed timestamps and deterministic password hashes for repeatable review/test fixtures.",
+    )
+    parser.add_argument(
+        "--base-time",
+        default=None,
+        help="ISO-8601 base timestamp for deterministic relative seed times.",
     )
     parser.add_argument(
         "--require-database",
@@ -39,21 +48,26 @@ async def run() -> int:
 
     sys.path.insert(0, str(ROOT_DIR))
 
-    from app import main as myuber
+    from app import main as rideops
     from app.seed import seed_demo_data
 
-    await myuber.initialize_database()
-    if args.require_database and not myuber.database_pool:
+    await rideops.initialize_database()
+    if args.require_database and not rideops.database_pool:
         print("DATABASE_URL is not configured or PostgreSQL is unavailable.", file=sys.stderr)
         return 1
 
-    summary = seed_demo_data(myuber, reset=args.reset)
-    await myuber.persist_runtime_state()
-    if myuber.database_pool:
-        await myuber.close_database()
+    summary = seed_demo_data(
+        rideops,
+        reset=args.reset,
+        deterministic=args.deterministic,
+        base_time=args.base_time,
+    )
+    await rideops.persist_runtime_state()
+    if rideops.database_pool:
+        await rideops.close_database()
 
     print(json.dumps(summary, indent=2, sort_keys=True))
-    if not myuber.DATABASE_URL:
+    if not rideops.DATABASE_URL:
         print(
             "No DATABASE_URL was configured; this run seeded only the current Python process. "
             "Use MYUBER_SEED_DEMO_DATA=true on API startup for in-memory demos.",
