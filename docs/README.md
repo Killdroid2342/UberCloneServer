@@ -1,4 +1,4 @@
-﻿# RideOps Server Docs
+# RideOps Server Docs
 
 This directory is the detailed documentation set for the FastAPI backend. The
 root [README](../README.md) covers quick local setup; this file is the map for
@@ -11,9 +11,11 @@ references.
 | [Swagger and OpenAPI](OPENAPI.md) | Interactive Swagger/ReDoc docs and generated OpenAPI contract |
 | [WebSocket API docs](WEBSOCKETS.md) | Server WebSocket endpoints, messages, auth, Redis fanout |
 | [DB schema diagram](DB_SCHEMA.md) | Runtime JSONB state, PostGIS driver-location index, logical domain model |
+| [Persistence setup](PERSISTENCE.md) | PostgreSQL setup, restart verification, seed behavior, reset and backup commands |
 | [Ride lifecycle diagram](RIDE_LIFECYCLE.md) | Ride state transitions, dispatch behavior, payment/cancellation side effects |
 | [Architecture diagram](ARCHITECTURE.md) | Full client/server system overview and external dependencies |
 | [Development tooling](DEVELOPMENT.md) | Linting, formatting, pre-commit hooks, and OpenAPI export |
 | [Environment configuration](ENVIRONMENT.md) | Local environment and seed-data configuration |
 
-Related client behavior lives in `../MyUberClient/docs` from the workspace root.
+Related client behavior lives in the sibling `RideOpsClient/docs` directory when
+both repos are checked out in the same workspace.
