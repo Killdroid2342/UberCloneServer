@@ -97,3 +97,57 @@ The JSONB document currently contains these top-level stores:
 
 The detailed logical model is in [DB_SCHEMA.md](DB_SCHEMA.md).
 
+## Local PostgreSQL Setup
+
+For a local PostgreSQL instance, create a database and set `DATABASE_URL` in
+`.env`:
+
+```powershell
+createdb rideops
+psql -d rideops -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+```
+
+```env
+DATABASE_URL=postgresql://rideops:rideops@localhost:5432/rideops
+REDIS_URL=
+MYUBER_SEED_DEMO_DATA=true
+MYUBER_SEED_DEMO_RESET=false
+```
+
+Then start the API:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+```
+
+When this repo is checked out with the sibling client repo inside the wider
+RideOps workspace, the parent Docker Compose stack can also provide PostgreSQL,
+PostGIS, Redis, the API, and the static client.
+
+## Seeding
+
+For local demos, set `MYUBER_SEED_DEMO_DATA=true` and the API seeds demo users
+on startup. Use `MYUBER_SEED_DEMO_RESET=true` only when you intentionally want to
+replace the existing runtime snapshot with fresh demo data.
+
+To seed explicitly into a configured database:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\seed_demo_data.py --env-file .env --require-database
+```
+
+For repeatable local review or tests, seed with a fixed clock and deterministic
+password hashes:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\seed_demo_data.py --env-file .env --reset --deterministic --base-time 2026-05-23T12:00:00+00:00
+```
+
+When `MYUBER_TEST_MODE=true`, local tests can reset through the API:
+
+```powershell
+curl -X POST http://localhost:8000/test/reset-demo-data -H "Content-Type: application/json" -d "{\"base_time\":\"2026-05-23T12:00:00+00:00\"}"
+```
+
+Keep `MYUBER_TEST_MODE=false` in shared and production deployments.
+
