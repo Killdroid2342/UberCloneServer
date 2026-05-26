@@ -92,3 +92,20 @@ sequenceDiagram
     API->>Realtime: ride_update completed
 ```
 
+## Side Effects By State
+
+### `matching`
+
+- Ride has been created and a wallet payment is `authorized`.
+- The ride is in the dispatch queue until an available active driver of the
+  requested vehicle type can be assigned.
+- Matching uses PostGIS when available; otherwise it uses in-memory Haversine
+  distance sorting.
+
+### `scheduled`
+
+- Ride has a future `scheduled_for` timestamp and a wallet payment is
+  `authorized`.
+- The scheduler moves it into `matching` when the pickup time is due.
+- Rider can cancel from this state.
+
