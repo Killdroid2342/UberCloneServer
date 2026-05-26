@@ -166,3 +166,28 @@ sequenceDiagram
 - Ride is retried automatically when a matching driver becomes available.
 - Rider can cancel from this state.
 
+## Driver Availability In The Lifecycle
+
+```mermaid
+flowchart TD
+    Offline["offline"]
+    Available["available"]
+    Pending["pending"]
+    Busy["busy"]
+
+    Offline -->|driver goes online| Available
+    Available -->|ride assigned| Pending
+    Pending -->|driver accepts| Busy
+    Pending -->|driver rejects or goes offline| Available
+    Busy -->|ride completed or cancelled| Available
+    Available -->|driver goes offline| Offline
+```
+
+Notes:
+
+- Drivers cannot go offline during accepted, arrived, or in-progress rides.
+- Going offline during a pending request declines that request and rematches the
+  ride.
+- Drivers cannot go online or receive dispatches until required documents are
+  verified by an admin.
+- Suspended drivers are forced offline and cannot go online.
