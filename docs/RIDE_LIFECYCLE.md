@@ -137,3 +137,32 @@ sequenceDiagram
 - Trip has started.
 - Rider receives a notification.
 
+### `completed`
+
+- Wallet payment is captured and marked `paid`.
+- A detailed receipt is generated and attached to the payment.
+- A receipt email is sent through SMTP when configured, or logged locally in
+  development.
+- Rider wallet balance is debited for the final fare.
+- Driver is released and becomes `available` unless they are offline.
+- Rider and driver receive completion notifications, with push delivery when
+  browser subscriptions and VAPID keys are configured.
+- Ride can now be rated by both rider and driver.
+- Rider may simulate a refund with `POST /rides/{ride_id}/refund`.
+
+### `cancelled`
+
+- Authorized wallet payment is voided for no-fee cancellations.
+- Rider cancellation from `accepted` or `arrived` charges a cancellation fee
+  before releasing the rest of the authorization.
+- Driver is released when assigned.
+- The other party receives a cancellation notification when applicable.
+- Driver socket also receives `ride_cleared`.
+
+### `no_drivers_available`
+
+- No active available driver could be assigned.
+- Ride remains in the dispatch queue with `queue_position` and `queue_size`.
+- Ride is retried automatically when a matching driver becomes available.
+- Rider can cancel from this state.
+
