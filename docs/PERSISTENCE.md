@@ -151,3 +151,45 @@ curl -X POST http://localhost:8000/test/reset-demo-data -H "Content-Type: applic
 
 Keep `MYUBER_TEST_MODE=false` in shared and production deployments.
 
+## Restart Verification
+
+Use this quick check any time you want proof that PostgreSQL is the source of
+truth across restarts:
+
+1. Start PostgreSQL and the API with `DATABASE_URL` configured.
+
+2. Create or update a ride, then confirm the runtime row exists:
+
+   ```powershell
+   psql "$env:DATABASE_URL" -c "SELECT id, updated_at FROM rideops_runtime_state;"
+   ```
+
+3. Restart the API process.
+
+4. Sign in again and check that the same rider wallet, ride history, admin audit
+   events, and driver state are still present.
+
+For automated coverage, `tests/test_persistence.py` simulates that same
+sequence: API mutation, PostgreSQL snapshot write, process state reset, snapshot
+reload, and a post-restart rider history read.
+
+## Backup And Reset
+
+Back up PostgreSQL with `pg_dump`:
+
+```powershell
+pg_dump "$env:DATABASE_URL" -Fc -f rideops.dump
+```
+
+Resetting local data depends on how PostgreSQL is running. For a Docker volume,
+remove the volume only when you intentionally want a fresh database. For a local
+database, drop and recreate the database or delete the `rideops_runtime_state`
+row.
+
+## Current Tradeoffs
+
+This persistence model is deliberate for a portfolio demo: it is easy to
+inspect, fast to bootstrap, and keeps the app deployable as one service. It is
+not a full normalized production schema yet. The next production step would be
+adding migrations and first-class relational tables for users, rides, payments,
+and events while keeping JSONB only for low-risk metadata.
