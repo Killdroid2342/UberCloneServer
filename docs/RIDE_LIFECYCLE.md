@@ -60,3 +60,35 @@ stateDiagram-v2
 | `arrived` | `cancelled` | rider or driver | `POST /rides/{ride_id}/cancel` |
 | `in_progress` | `completed` | driver | `POST /rides/{ride_id}/status` with `completed` |
 
+## Main Flow
+
+```mermaid
+sequenceDiagram
+    participant Rider
+    participant API
+    participant Driver
+    participant Payment as Wallet Payment
+    participant Realtime
+
+    Rider->>API: POST /rides
+    API->>Payment: authorize wallet fare
+    API->>API: status matching
+    API->>Driver: ride_request
+    API->>Realtime: ride_update pending_driver
+
+    Driver->>API: POST /rides/{id}/accept
+    API->>API: status accepted
+    API->>Realtime: ride_update accepted
+
+    Driver->>API: POST /rides/{id}/status arrived
+    API->>Realtime: ride_update arrived
+
+    Driver->>API: POST /rides/{id}/status in_progress
+    API->>Realtime: ride_update in_progress
+
+    Driver->>API: POST /rides/{id}/status completed
+    API->>Payment: capture payment
+    API->>API: release driver
+    API->>Realtime: ride_update completed
+```
+
