@@ -109,3 +109,31 @@ sequenceDiagram
 - The scheduler moves it into `matching` when the pickup time is due.
 - Rider can cancel from this state.
 
+### `pending_driver`
+
+- A driver has been selected.
+- Driver availability becomes `pending`.
+- Driver `current_ride_id` is set.
+- Driver receives a `ride_request` websocket event.
+- Rider and driver receive notifications.
+- `dispatch_expires_at` is set from `MYUBER_DISPATCH_TIMEOUT_SECONDS`; if the
+  driver does not accept or reject before then, the ride is returned to
+  `matching` and the driver is added to the declined set.
+
+### `accepted`
+
+- Driver accepted the request.
+- Driver availability becomes `busy`.
+- Driver accepted counter increments.
+- Rider receives a notification.
+
+### `arrived`
+
+- Driver reached the pickup point.
+- Rider receives a notification.
+
+### `in_progress`
+
+- Trip has started.
+- Rider receives a notification.
+
