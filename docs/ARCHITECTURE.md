@@ -1,4 +1,4 @@
-﻿# Architecture Diagram
+# Architecture Diagram
 
 RideOps is a small ride-hailing demo application with a TypeScript browser
 client, a FastAPI backend, optional PostgreSQL/PostGIS persistence, optional
@@ -6,19 +6,21 @@ Redis cache/pubsub, and external map/routing providers.
 
 ## Code Organization
 
-The backend keeps `app/main.py` as the FastAPI composition root and
-`app/seed.py` as the demo fixture builder. Shared behavior is documented around
-observable contracts: the API surface, runtime data model, ride lifecycle,
-WebSocket messages, and environment configuration. Future extraction should
-start with pure business policy and tests before adding package structure.
+The backend keeps `app/main.py` as the FastAPI composition root, with route
+registration split under `app/routes/`, demo fixtures in `app/seed.py`, and
+PostgreSQL/PostGIS persistence behind `app/runtime_store.py`. Shared behavior is
+documented around observable contracts: the API surface, runtime data model,
+ride lifecycle, WebSocket messages, and environment configuration. Future
+extraction should continue from storage and routing boundaries into pure
+business policy modules with tests.
 
 ## System Diagram
 
 ```mermaid
 flowchart LR
-    Browser["Browser client\nMyUberClient"]
+    Browser["Browser client\nRideOpsClient"]
     Static["Static client files"]
-    API["FastAPI app\nMyUberServer"]
+    API["FastAPI app\nRideOpsServer"]
     Runtime["Runtime dictionaries\nriders drivers rides notifications"]
     Security["Security controls\nvalidation XSS headers rate limits\nrefresh tokens abuse/fraud events"]
     Platform["Platform controls\nfeature flags API versions drain circuit breakers"]
@@ -154,6 +156,9 @@ draining, but `/health/live` continues to report process liveness.
 
 - If `DATABASE_URL` is missing or PostgreSQL connection fails, the app uses
   in-memory state only.
+- PostgreSQL persistence is isolated behind `RuntimeStateStore`, which owns
+  schema setup, state restore, state snapshots, and PostGIS driver-location
+  projection queries.
 - If PostGIS setup fails, nearest-driver matching falls back to Haversine
   sorting in Python.
 - If Redis is missing or unavailable, caching and cross-instance websocket
