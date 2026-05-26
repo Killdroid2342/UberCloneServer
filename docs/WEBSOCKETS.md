@@ -1,7 +1,7 @@
 # WebSocket Documentation
 
 The server exposes three realtime sockets. The TypeScript client wraps them in
-`MyUberClient/src/socket.ts` and typed helpers in `MyUberClient/src/api.ts`.
+`RideOpsClient/src/socket.ts` and typed helpers in `RideOpsClient/src/api.ts`.
 
 ## Client Behavior
 
@@ -322,7 +322,7 @@ instances ignore events with their own `origin` to avoid duplicate delivery.
   backoff using `MYUBER_REALTIME_REDIS_PUBLISH_ATTEMPTS` and
   `MYUBER_REALTIME_REDIS_RETRY_BASE_MS`.
 - Client application is effectively exactly-once per stream because
-  `MyUberClient/src/socket.ts` drops duplicate `event_id` values.
+  `RideOpsClient/src/socket.ts` drops duplicate `event_id` values.
 - Ordering is per target, using a monotonically increasing `sequence` for each
   `ride`, `driver`, or `share` stream.
 - Failed Redis publishes are stored in the in-process realtime dead letter queue
